@@ -115,8 +115,11 @@ def relayout_module(mod):
 
     # text: adrp / adr / literal loads into the moved part.
     # +4 is the MOD0 u32 offset (never code); small inline literal pools in text (below nso_code.DATA_MIN) are collected from in-text literal loads so their bytes are not rewritten.
+    # A reference the move follows points into the moved part, so its target lies in [do, do + data + bss): a text word that decodes like adr/adrp/literal but targets
+    # anything past the module (ASCII in text, for one: 'icOp' decodes as adr) is data, and rewriting its immediate would corrupt it.
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    moved_end = do + dsz + mod.bss
     blocks = list(nso_code.data_blocks(bytearray(old), tsz, md)) + [(4, 8)]
     if m0 < tsz: blocks.append((m0, min(tsz, m0 + 28)))   # MOD0 in text: b'MOD0' (0x30444F4D) matches the adr bitmask
     code = lambda a: not any(s <= a < e for s, e in blocks)
@@ -138,11 +141,11 @@ def relayout_module(mod):
             imm = sx(((w >> 5) & 0x7FFFF) << 2 | (w >> 29) & 3, 21)
             if w >> 31:
                 t = (a & ~0xFFF) + (imm << 12)
-                if t < do: continue
+                if not do <= t < moved_end: continue
                 imm += D >> 12; n['adrp'] += 1
             else:
                 t = a + imm
-                if t < do: continue
+                if not do <= t < moved_end: continue
                 imm += D; n['adr'] += 1
             if not -(1 << 20) <= imm < 1 << 20: raise Error(f'adr(p) at {a:#x} out of range after the move')
             imm &= 0x1FFFFF
@@ -150,7 +153,7 @@ def relayout_module(mod):
             struct.pack_into('<I', new, a, w)
         elif w & 0x3B000000 == 0x18000000 and (w & 0xFF000000) != 0xDC000000:   # ldr / ldrsw / prfm (literal), excluding unallocated opc=3 V=1
             imm = sx((w >> 5) & 0x7FFFF, 19); t = a + imm * 4
-            if t < do: continue
+            if not do <= t < moved_end: continue
             imm += D >> 2
             if not -(1 << 18) <= imm < 1 << 18: raise Error(f'literal load at {a:#x} out of range after the move')
             struct.pack_into('<I', new, a, (w & 0xFF00001F) | (imm & 0x7FFFF) << 5); n['literal'] += 1

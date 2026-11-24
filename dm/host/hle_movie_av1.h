@@ -1,4 +1,4 @@
-// AV1 decoding on VideoToolbox or dav1d (hle_movie_av1.c), for the nn::codec decoders of the Switch 2's SDK (hle_codec_video.c)
+// AV1 decoding for nn::codec: VideoToolbox or dav1d on Apple, dav1d on Windows.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -9,7 +9,7 @@ typedef struct mav1 mav1;
 typedef struct { const uint8_t *y, *uv; size_t ystride, uvstride; int w, h, matrix, full_range; int64_t ts; } mav1_picture;
 
 struct movie_vt_control;
-mav1 *mav1_new(struct movie_vt_control *control);
+mav1 *mav1_new(struct movie_vt_control *control);   // Windows: pass NULL; returns NULL if the decoder cannot be opened
 void mav1_free(mav1 *a);
 void mav1_reset(mav1 *a);   // a new stream starts at the next packet with a sequence header
 // One temporal unit (OBUs with their sizes) and its time. 1 and *out set: a picture, the oldest not yet given; 0: nothing to show now (no sequence header seen yet, a unit
@@ -17,8 +17,8 @@ void mav1_reset(mav1 *a);   // a new stream starts at the next packet with a seq
 int mav1_decode(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1_picture *out);
 // More pictures after mav1_decode, one a call until it returns 0. drain 0: those the unit's last part gives (dav1d gave a picture before it had taken the whole unit).
 // drain 1: also the pictures of the frames dav1d still decodes, waiting for each: at the end of the stream, or when no unit follows this one for now. Once such a call has
-// given a picture, the calls go on until one returns 0 before the next mav1_decode (dav1d's drain cannot be left halfway: dav1d_step)
+// given a picture, the calls go on until one returns 0 before the next mav1_decode (dav1d's drain cannot be left halfway)
 int mav1_next(mav1 *a, int drain, mav1_picture *out);
 const char *mav1_backend(const mav1 *a);   // "VideoToolbox" (its hardware decoder: Apple M3 and A17 Pro on) or "dav1d"
-// Exposed for its test: fills the 4 + n bytes of an av1C record from a sequence header OBU (with its header and size); 0 when the OBU cannot be read
+// Exposed for its test: fills the first four bytes of an av1C record from a sequence header OBU (with its header and size); 0 when the OBU cannot be read
 int mav1_av1c(const uint8_t *obu, size_t n, uint8_t c[4], int *w, int *h);

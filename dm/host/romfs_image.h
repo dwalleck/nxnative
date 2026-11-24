@@ -1,44 +1,94 @@
 // DMROMFS1's index loader, shared by the host mount and iOS startup. Startup must validate the same index before replacing a working folder.
 #pragma once
+#include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef DM_ROMFS_WIN32
+#include <windows.h>
+typedef HANDLE romfs_file;
+typedef int64_t romfs_offset;
+typedef wchar_t romfs_path_char;
+#else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+typedef int romfs_file;
+typedef off_t romfs_offset;
+typedef char romfs_path_char;
+#endif
 
-typedef struct { uint64_t a, b; uint32_t name; uint16_t nlen; uint8_t type, flags; } __attribute__((packed)) img_ent;   // directory: a = first child, b = children; file: a = offset, b = size
-_Static_assert(sizeof(img_ent) == 24, "RomFS image entry layout");
+typedef struct { uint64_t a, b; uint32_t name; uint16_t nlen; uint8_t type, flags; } img_ent;   // directory: a = first child, b = children; file: a = offset, b = size
+static_assert(sizeof(img_ent) == 24, "RomFS image entry layout");
 #define IMG_ENT_DAMAGED 1    // in the image: this file failed the NCA's hash check and was written as read (nx_extract --allow-damaged)
 #define IMG_ENT_REPORTED 2   // in memory only: the host has named this damaged file in its log
-typedef struct { int fd; uint64_t n, damaged; img_ent *e; const char *names; } romfs_img;
+typedef struct { romfs_file fd; uint64_t n, damaged; img_ent *e; const char *names; } romfs_img;
 
-static void romfs_image_close(romfs_img *m) {
-    if (m) { close(m->fd); free(m->e); free(m); }
+static void romfs_image_close_fd(romfs_file fd) {
+#ifdef DM_ROMFS_WIN32
+    CloseHandle(fd);
+#else
+    close(fd);
+#endif
 }
-static int romfs_image_read(int fd, void *buf, size_t size, off_t off) {
+static void romfs_image_close(romfs_img *m) {
+    if (m) { romfs_image_close_fd(m->fd); free(m->e); free(m); }
+}
+static int romfs_image_read(romfs_file fd, void *buf, size_t size, romfs_offset off) {
     size_t got = 0;
+#ifdef DM_ROMFS_WIN32
+    // This descriptor is private to RomFS. Serialize the seek and read so guest
+    // callers on different threads do not change each other's offsets.
+    static SRWLOCK cursor = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&cursor);
+    LARGE_INTEGER position;
+    position.QuadPart = off;
+    if (!SetFilePointerEx(fd, position, NULL, FILE_BEGIN)) { errno = EIO; ReleaseSRWLockExclusive(&cursor); return 0; }
+#endif
     while (got < size) {
-        ssize_t n = pread(fd, (char *)buf + got, size - got, off + (off_t)got);
+#ifdef DM_ROMFS_WIN32
+        size_t left = size - got;
+        DWORD n;
+        if (!ReadFile(fd, (char *)buf + got, left > (8u << 20) ? (8u << 20) : (DWORD)left, &n, NULL)) { errno = EIO; break; }
+        if (!n) { errno = EINVAL; break; }
+#else
+        ssize_t n = pread(fd, (char *)buf + got, size - got, off + (romfs_offset)got);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { if (!n) errno = EINVAL; return 0; }
+        if (n <= 0) { if (!n) errno = EINVAL; break; }
+#endif
         got += (size_t)n;
     }
-    return 1;
+#ifdef DM_ROMFS_WIN32
+    ReleaseSRWLockExclusive(&cursor);
+#endif
+    return got == size;
 }
 // NULL for an incomplete or invalid image (errno EINVAL), an I/O error, or allocation failure. The caller owns the descriptor and index on success.
-static romfs_img *romfs_image_open(const char *path) {
-    int fd = open(path, O_RDONLY); struct stat st; uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n;
+static romfs_img *romfs_image_open(const romfs_path_char *path) {
+    uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n;
+    romfs_offset size;
+#ifdef DM_ROMFS_WIN32
+    romfs_file fd = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fd == INVALID_HANDLE_VALUE) { errno = EIO; return NULL; }
+    LARGE_INTEGER length;
+    if (!GetFileSizeEx(fd, &length)) { errno = EIO; goto bad; }
+    size = length.QuadPart;
+#else
+    romfs_file fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
-    if (fstat(fd, &st) || !romfs_image_read(fd, h, sizeof h, 0)) goto bad;
+    struct stat st;
+    if (fstat(fd, &st)) goto bad;
+    size = st.st_size;
+#endif
+    if (!romfs_image_read(fd, h, sizeof h, 0)) goto bad;
     errno = EINVAL;
-    if (memcmp(h, "DMROMFS1", 8) || st.st_size < (off_t)sizeof h) goto bad;
+    if (memcmp(h, "DMROMFS1", 8) || size < (romfs_offset)sizeof h) goto bad;
     memcpy(&ioff, h + 8, 8); memcpy(&isz, h + 16, 8); memcpy(&n, h + 24, 8);
-    if (!n || n > UINT32_MAX || ioff < sizeof h || ioff > (uint64_t)st.st_size || isz != (uint64_t)st.st_size - ioff || isz > SIZE_MAX || n > isz / sizeof(img_ent)) goto bad;
+    if (!n || n > UINT32_MAX || ioff < sizeof h || ioff > (uint64_t)size || isz != (uint64_t)size - ioff || isz > SIZE_MAX || n > isz / sizeof(img_ent)) goto bad;
     if (!(m = calloc(1, sizeof *m))) goto bad;
     m->fd = fd;
-    if (!(m->e = malloc((size_t)isz)) || !romfs_image_read(fd, m->e, (size_t)isz, (off_t)ioff)) goto bad;
+    if (!(m->e = malloc((size_t)isz)) || !romfs_image_read(fd, m->e, (size_t)isz, (romfs_offset)ioff)) goto bad;
     m->n = n; m->names = (const char *)m->e + n * sizeof(img_ent);
     uint64_t pool = isz - n * sizeof(img_ent), next_child = 1;
     errno = EINVAL;
@@ -69,7 +119,31 @@ static romfs_img *romfs_image_open(const char *path) {
     return m;
 bad: {
     int e = errno ? errno : EINVAL;
-    if (m) romfs_image_close(m); else close(fd);
+    if (m) romfs_image_close(m); else romfs_image_close_fd(fd);
     errno = e; return NULL;
     }
+}
+
+static inline int64_t romfs_image_find(const romfs_img *m, const char *rest) {
+    uint64_t k = 0;
+    while (*rest) {
+        while (*rest == '/') rest++;
+        if (!*rest) break;
+        const char *end = strchr(rest, '/'); if (!end) end = rest + strlen(rest);
+        size_t len = (size_t)(end - rest);
+        if (!(len == 1 && rest[0] == '.')) {
+            if (m->e[k].type) { errno = ENOTDIR; return -1; }
+            uint64_t lo = m->e[k].a, hi = lo + m->e[k].b; int found = 0;
+            while (lo < hi) {
+                uint64_t mid = lo + (hi - lo) / 2; const img_ent *x = &m->e[mid];
+                int c = memcmp(m->names + x->name, rest, x->nlen < len ? x->nlen : len);
+                if (!c) c = (x->nlen > len) - (x->nlen < len);
+                if (!c) { k = mid; found = 1; break; }
+                if (c < 0) lo = mid + 1; else hi = mid;
+            }
+            if (!found) { errno = ENOENT; return -1; }
+        }
+        rest = end;
+    }
+    return (int64_t)k;
 }

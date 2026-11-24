@@ -18,7 +18,7 @@ nodes: list[ast.stmt] = [
     or isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constants for t in n.targets)
 ]
 # The emitter's existing helpers use their module globals, including the test patch buffer.
-helpers = {'here', 'emit', 'emit_key_addr', 'emit_slot_addr'}
+helpers = {'here', 'emit', 'emit_key_addr', 'emit_slot_addr', 'emit_thread_slot'}
 nodes.extend(n for n in slots.tree.body if isinstance(n, ast.FunctionDef) and n.name in helpers)
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(slots.TOOLS / 'patch_nso.py'), 'exec'), scope)
 

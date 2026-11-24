@@ -123,6 +123,17 @@ class Layout(unittest.TestCase):
         self.assertEqual(got[6], 0xDC000000)              # unallocated opc=3 V=1 untouched
         self.assertEqual(got[8], ADRP(5, pool, 0x2100))   # inline literal pool word untouched
 
+    def test_data_words_that_decode_like_references_stay(self):
+        # Text can hold data that decodes like adr/adrp/ldr literal (ASCII 'icOp' decodes as an adr with a target past the module).
+        # Only a target inside the module's moved memory is a reference the move follows; rewriting the others corrupts the data.
+        image = bytearray(math_nro())
+        words = (adr(0, 0x300, 0x8000), ADRP(1, 0x304, 0x20000), ldr_lit(2, 0x308, 0x8000))
+        struct.pack_into('<3I', image, 0x300, *words)
+        new, D, _ = mod_layout.relayout_module(nso.load(bytes(image), 'Math'))
+        self.assertEqual(D, 0x2000)
+        self.assertEqual(struct.unpack_from('<3I', new.image, 0x300), words)
+        self.assertEqual(struct.unpack_from('<I', new.image, FN)[0], ADRP(0, FN, 0x2100 + D))   # the genuine one still moves
+
     def test_tables_and_tls_symbol(self):
         D, n = self.D, self.new_mod.image
         m0 = struct.unpack_from('<I', n, 4)[0]

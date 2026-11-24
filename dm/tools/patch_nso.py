@@ -1,5 +1,5 @@
-# Generic NSO rewriter: Switch aarch64 module → an image that can execute natively on Apple systems.
-# Usage: patch_nso.py <NSO file> <output dir> <module name>
+# Generic NSO rewriter: Switch AArch64 module → a native image for the Apple host (default), or an experimental Windows ARM64 image.
+# Usage: patch_nso.py <NSO file> <output dir> <module name> [--target=windows-arm64]
 # Rewrites (the Apple kernel modifies x18 and tpidr_el0; Horizon's thread area, svc and timers have no counterpart on Apple):
 #   x18 read/write      → thread slot K18 (TSD, via tpidrro_el0)
 #   mrs tpidr_el0       → read thread slot KTLS; msr tpidr_el0 → write KTLS
@@ -14,7 +14,7 @@
 #   Registered cuts (CUTS of the patch files, restricted by NSO build ID, see "Registered patches"): before rewriting, the original bytes are asserted one by one and any mismatch aborts; results are listed in <name>.cuts.tsv
 #   Function-matched cuts (MATCH_CUTS of the selected game's patches.py): unknown builds only, unique complete-function and direct-callee fingerprints, then original-byte assertions
 #   Registered observation gates (OBS of the patch files, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
-# The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
+# The Apple loader fills the key page with "actual key number × 8". Windows stores PE TLS slot offsets and the TLS index × 8 instead; see emit_thread_slot.
 # Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR; a text longer than a B reaches adds a second one after the image, see TWO), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv, <name>.changed.tsv (the text words whose instructions no longer run as the file has them)
 import struct, re, sys, os, glob, shlex, types, importlib.util, multiprocessing, signal
 from itertools import combinations
@@ -28,11 +28,17 @@ from nso_asm import *   # the instruction encoders (B, ADRP, LDRX, ...), shared 
 
 # The NSP script terminates a failed or cancelled rewrite with SIGTERM. Exit through the pool's context manager so it reaps the workers too.
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-try: WORKERS = int(os.environ.get('DM_REWRITE_J') or os.cpu_count() or 1)
+CAN_FORK = hasattr(signal, 'pthread_sigmask') and 'fork' in multiprocessing.get_all_start_methods()
+try: WORKERS = int(os.environ.get('DM_REWRITE_J') or (os.cpu_count() if CAN_FORK else 1) or 1)
 except ValueError: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
 if WORKERS < 1: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
+if WORKERS > 1 and not CAN_FORK: sys.exit('[RED] DM_REWRITE_J must be 1 on hosts without POSIX fork and signal masks')
 
-src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
+if len(sys.argv) not in (4, 5) or (len(sys.argv) == 5 and sys.argv[4] not in ('--target=apple', '--target=windows-arm64')):
+    sys.exit('[RED] usage: patch_nso.py <NSO or NRO> <output dir> <module name> [--target=apple|windows-arm64]')
+src, outdir, NAME = sys.argv[1:4]
+WINDOWS = sys.argv[4:] == ['--target=windows-arm64']
+OUTPUT_NAME = NAME + '.winarm64' if WINDOWS else NAME
 # An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
 # against its header before anything is allocated (a damaged module stops here with a [RED] line)
 MOD = nso.cli_read(src)
@@ -167,7 +173,7 @@ if BUILD_ID not in PATCHES['CUTS']:
     cuts += resolve(IMG, TEXT_END, PATCHES['SDK_MATCH_CUTS'].get(NAME, []), outcomes=sdk_outcomes, red=False, alias_only=ALIAS_OFFS)
     if BUILD_ID not in own and (known or outcomes or sdk_outcomes):   # a build the game was brought up on lost nothing
         os.makedirs(outdir, exist_ok=True)
-        with open(os.path.join(outdir, NAME + '.match.tsv'), 'w') as f:
+        with open(os.path.join(outdir, OUTPUT_NAME + '.match.tsv'), 'w') as f:
             f.write(f'# {NAME} {BUILD_ID}: not a registered build. registered: build ID, display version, cuts; patch (the game profile\'s) or sdk (SDK-wide): name, cut offsets or -, implementation or why not\n')
             for bid, disp, n in known: f.write(f'registered\t{bid}\t{disp}\t{n}\n')
             for kind, got in (('patch', outcomes), ('sdk', sdk_outcomes)):
@@ -198,9 +204,10 @@ for off, ob, nb, why in cuts:
     assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     if off in ALIAS_OFFS: assert len(ob) <= 16 and off + len(ob) <= TEXT_END, f'ALIAS_CUT at {off:#x} exceeds loader bounds'
     IMG[off:off + len(nb)] = nb
-# Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
+# Key page indices are fixed; the loader fills them with target-specific values.
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511}
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
+if WINDOWS: KEY_INDEX['WIN_TLS'] = len(KEY_INDEX)
 
 # ---- Unreal console variables in main (dm/tools/ue_cvar.py finds them by their registered names, without a build ID) ----
 # The fixups table names each one's TAutoConsoleVariable (UE_CVAR:<name>); the host writes those the profile decides on (hle_fpslock.c, hle_uecvar.c)
@@ -306,6 +313,16 @@ def emit_key_addr(reg, kind):
 def emit_slot_addr(base, key_reg, kind):
     emit_key_addr(key_reg, kind); emit(ADDR(base, base, key_reg))
 
+def emit_thread_slot(base, key_reg, kind):
+    if WINDOWS:
+        # PE implicit TLS as emitted by the Windows ARM64 compiler: x18 is the TEB, +0x58 is its TLS vector.
+        # The loader writes the module's TLS index × 8 and the byte offset of each slot in its PE TLS block.
+        emit(LDRX(base, 18, 0x58 // 8))
+        emit_key_addr(key_reg, 'WIN_TLS'); emit(ADDR(base, base, key_reg)); emit(LDRX(base, base))
+    else:
+        emit(MRS_TPIDRRO(base))
+    emit_slot_addr(base, key_reg, kind)
+
 # ---- Encoders: dm/tools/nso_asm.py (imported above) ----
 
 def dis(w, addr):
@@ -358,13 +375,30 @@ def sp_delta(ins):
     assert not re.match(r'(sp|wsp),', ins.op_str), f'writes sp: {ins.address:x} {ins.op_str}'
     return 0
 
+def site_win_stack_writeback(ins, delta):
+    """Run an SP-relative access through a copy of the original SP, then restore the scratch frame and apply writeback."""
+    S, T, U = pick(regs_in(ins), 3)
+    start, frame = here(), 32 + max(0, -delta)
+    word = (subst(ins, S) & ~(31 << 5)) | (U << 5)
+    copied = dis(word, start)
+    want = re.sub(r'\b([xw])18\b', lambda m: f'{m[1]}{S}', ins.op_str).replace('[sp', f'[x{U}')
+    if copied.mnemonic != ins.mnemonic or copied.op_str != want:
+        sys.exit(f'[RED] Cannot rebase Windows stack access at {ins.address:#x}: {ins.mnemonic} {ins.op_str}')
+    emit(STP_PRE(S, T, 31, -frame)); emit(STRX(U, 31, 2))
+    emit_thread_slot(T, S, 'K18'); emit(LDRX(S, T)); emit(ADDI(U, 31, frame))
+    emit(word); emit(STRX(S, T))
+    emit(LDRX(U, 31, 2)); emit(LDP(S, T, 31, 0)); emit(ADDI(31, 31, frame + delta))
+    emit(BX(here(), ins.address + 4))
+    return start
+
+
 def site_plain(ins):
     S, T = pick(regs_in(ins))
     dlt = sp_delta(ins)
     save = -16 if dlt == 0 else -112          # Instructions that modify sp write below sp, so the scratch save is placed deep in the reserved area
     assert dlt == 0 or dlt >= -96, f'sp delta {dlt} at {ins.address:x}'
     start = here()
-    emit(STP(S, T, 31, save)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, save)); emit_thread_slot(T, S, 'K18'); emit(LDRX(S, T))
     emit(subst(ins, S))
     emit(STRX(S, T))                 # Always write back: capstone can miss reporting a write (the adds w18 instance)
     emit(LDP(S, T, 31, save - dlt)); emit(BX(here(), ins.address + 4))
@@ -420,7 +454,7 @@ def site_select(ins, args, temp):
     rd, other, other_cond, wide = args
     start, skip = here(), len(patch)
     emit(NOP)  # filled with the conditional branch once the other arm's address is known
-    emit(MRS_TPIDRRO(temp)); emit_slot_addr(temp, rd, 'K18')
+    emit_thread_slot(temp, rd, 'K18')
     emit(LDRX(rd, temp) if wide else 0xB9400000 | (temp << 5) | rd)  # ldr wD,[xT] zero-extends the result
     emit(BX(here(), ins.address + 4))
     struct.pack_into('<I', patch, skip, BEQ(start, here()) | other_cond)
@@ -485,7 +519,7 @@ def site_cond(ins):
     S, T = pick(regs_in(ins))
     tgt = ins.operands[-1].imm
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_thread_slot(T, S, 'K18'); emit(LDRX(S, T))
     m = ins.mnemonic
     taken = here() + 4 * 3
     off = (taken - here()) >> 2
@@ -501,7 +535,7 @@ def site_pcrel(ins):
     tgt = ins.operands[1].imm
     S, T = pick(set())
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18')   # S first serves as a temporary for the key page offset; the next instruction then loads the target value
+    emit(STP(S, T, 31, -16)); emit_thread_slot(T, S, 'K18')   # S first serves as a temporary for the key page offset; the next instruction then loads the target value
     pc = here(); emit(ADRP(S, pc, tgt))
     if ins.mnemonic == 'adr': emit(ADDI(S, S, tgt & 0xFFF))
     emit(STRX(S, T))
@@ -511,8 +545,9 @@ def site_pcrel(ins):
 def site_br(ins, base, count):
     """Jump table br x18: target = base + 4i. Stash x16 in the red zone → equally spaced landing pads → restore x16 → original target."""
     start = here()
-    emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))   # x16 / x17 are temporary registers that can stay live within a function; save them to the red zone before borrowing
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -24))
+    if WINDOWS: emit(STP(16, 17, 31, -16))
+    else: emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))
+    emit_thread_slot(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -8 if WINDOWS else -24))
     padbase = start + 4 * 24
     delta = padbase - base
     op = ADDI if delta >= 0 else SUBI; dl = abs(delta)
@@ -534,22 +569,29 @@ def site_br_tab(ins, targets):
     """Offset-table br x18 (ldrsw x18,[xB,x18,lsl #2]; add x18,x18,xB): target = table base + signed entry; the table is constant, so all targets are read at rewrite time.
     x16 = guest x18, compared with each target in turn (adrp + add put the target address in x17); on a match restore x16 / x17 and jump to the original target; no match → brk (the original bounds check already stops out-of-range indices)"""
     start = here()
-    emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))   # as in site_br: save x16 / x17 to the red zone before borrowing
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16))
+    if WINDOWS: emit(STP(16, 17, 31, -16))
+    else: emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))
+    emit_thread_slot(16, 17, 'K18'); emit(LDRX(16, 16))
     uniq = sorted(set(targets))
     pads = here() + 4 * (4 * len(uniq) + 1)
     for k, t in enumerate(uniq):
-        emit(ADRP(17, here(), t)); emit(ADDI(17, 17, t & 0xFFF)); emit(CMPR(16, 17)); emit(BEQ(here(), pads + 12 * k))
+        emit(ADRP(17, here(), t)); emit(ADDI(17, 17, t & 0xFFF))
+        if WINDOWS:
+            emit(0xCB110211)  # sub x17,x16,x17, then cbz x17, preserving NZCV across the original branch
+            emit((BEQ(here(), pads + 8 * k) & 0x00FFFFE0) | 0xB4000011)
+        else: emit(CMPR(16, 17)); emit(BEQ(here(), pads + 12 * k))
     emit(BRK(0x18))
     for t in uniq:
-        emit(LDUR(16, 31, -16)); emit(LDUR(17, 31, -24)); emit(BX(here(), t))
+        if WINDOWS: emit(LDP(16, 17, 31, -16))
+        else: emit(LDUR(16, 31, -16)); emit(LDUR(17, 31, -24))
+        emit(BX(here(), t))
     return start
 
 def site_blr(ins):
     """blr x18 (Engage main+0x9ff324): x16 = guest x18, x30 = the instruction after the original blr, br x16. At a call site x16 / x17 are intra-procedure-call temporaries under the calling convention, so they need no saving;
     the return address is the original one, so the callee returns straight there (IL2CPP's C++ exceptions look up unwind tables by return address and must not stop in the patch area)"""
     start = here()
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16))
+    emit_thread_slot(16, 17, 'K18'); emit(LDRX(16, 16))
     ret = ins.address + 4
     emit(ADRP(30, here(), ret)); emit(ADDI(30, 30, ret & 0xFFF)); emit(BR(16))
     return start
@@ -557,19 +599,21 @@ def site_blr(ins):
 def site_br_call(ins):
     """br x18 as an indirect tail call (tail_call): x16 = guest x18, br x16. As at site_blr, x16 / x17 are intra-procedure-call temporaries at a call, and x30 keeps the caller's return address"""
     start = here()
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(BR(16))
+    emit_thread_slot(16, 17, 'K18'); emit(LDRX(16, 16)); emit(BR(16))
     return start
 
 def site_slot_copy(ins, src, dst):
     """A system register access whose general-purpose register is x18: the guest's x18 is the thread slot K18, so the access becomes a copy from one thread slot to another
     (mrs x18, tpidr_el0: KTLS → K18; mrs x18, tpidrro_el0: KTLR → K18; msr tpidr_el0, x18: K18 → KTLS), or src is a word that puts the value in x15 (mrs x18, ctr_el0).
-    The Apple kernel may change x18 at any instruction, so the value never passes through it: x15 carries it, and x16 / x17 form the slot addresses, all three saved in the red zone"""
+    x18 is reserved by the host: x15 carries the value and x16/x17 form the slot addresses. On Windows the red zone is only 16 bytes, so allocate a frame for all three."""
     start = here()
-    emit(STP(16, 17, 31, -16)); emit(STUR(15, 31, -24))
-    if isinstance(src, str): emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, src); emit(LDRX(15, 16))
+    if WINDOWS: emit(STP_PRE(16, 17, 31, -32)); emit(STRX(15, 31, 2))
+    else: emit(STP(16, 17, 31, -16)); emit(STUR(15, 31, -24))
+    if isinstance(src, str): emit_thread_slot(16, 17, src); emit(LDRX(15, 16))
     else: emit(src)
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, dst); emit(STRX(15, 16))
-    emit(LDUR(15, 31, -24)); emit(LDP(16, 17, 31, -16))
+    emit_thread_slot(16, 17, dst); emit(STRX(15, 16))
+    if WINDOWS: emit(LDRX(15, 31, 2)); emit(LDP_POST(16, 17, 31, 32))
+    else: emit(LDUR(15, 31, -24)); emit(LDP(16, 17, 31, -16))
     emit(BX(here(), ins.address + 4))
     return start
 
@@ -579,7 +623,8 @@ def site_sysreg_read(ins, kind):
     if N == 18: return site_slot_copy(ins, kind, 'K18')
     tmp = 16 if N != 16 else 17
     start = here()
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(N)); emit_slot_addr(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))   # tmp is saved by borrowing the red zone
+    if not WINDOWS or N != 31:   # Windows slot lookup needs a destination; mrs xzr discards its value.
+        emit(STUR(tmp, 31, -16)); emit_thread_slot(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))
     emit(BX(here(), ins.address + 4))
     return start
 
@@ -588,10 +633,12 @@ def site_tpidr_write(ins):
     if N == 18: return site_slot_copy(ins, 'K18', 'KTLS')
     (T,) = pick({N}, 1)
     start = here()
-    emit(0xF81F0000 | (31 << 5) | T)           # stur xT,[sp,#-16]
     tmp = next(x for x in (16, 17) if x not in (N, T))
-    emit(STUR(tmp, 31, -24)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, tmp, 'KTLS'); emit(STRX(N, T)); emit(LDUR(tmp, 31, -24))
-    emit(0xF85F0000 | (31 << 5) | T)           # ldur xT,[sp,#-16]
+    if WINDOWS: emit(STP(T, tmp, 31, -16))
+    else: emit(STUR(T, 31, -16)); emit(STUR(tmp, 31, -24))
+    emit_thread_slot(T, tmp, 'KTLS'); emit(STRX(N, T))
+    if WINDOWS: emit(LDP(T, tmp, 31, -16))
+    else: emit(LDUR(tmp, 31, -24)); emit(LDUR(T, 31, -16))
     emit(BX(here(), ins.address + 4))
     return start
 
@@ -599,7 +646,7 @@ def emit_gate_call():
     """Common section of a gate block (right after stp x29,x30,[sp,#-16]! and before blr x30): x30 = the gate address in thread slot KGATE.
         Fetching the slot through the key page needs a second register to be borrowed; x29 is borrowed and then immediately restored from the stack: the x29 saved by _dm_gate must be
         the guest's original value, since the crash backtrace walks the x29 chain."""
-    emit(MRS_TPIDRRO(30)); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
+    emit_thread_slot(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
 
 def site_gate(ins, kind, arg):
     """svc / mrs cntpct_el0 → host gate. The gate address is taken from thread slot KGATE; the gate looks up gates.tsv by return point (the address of this block's ldp)."""
@@ -1406,6 +1453,9 @@ if GAP:
 
 
 def put_branch(at, to): struct.pack_into('<I', IMG, at, BX(at, to))
+if WINDOWS and (windows or retries):
+    at = windows[0][0].address if windows else retries[0][0][0][0].address
+    sys.exit(f'[RED] Windows ARM64 prototype does not support x18 exclusive windows ({at:#x})')
 for wseg in windows:
     use_area(wseg[0].address); st, lo, hi = site_window(wseg); stat('window'); put_branch(lo, st)
 for parts in retries:
@@ -1417,6 +1467,15 @@ for a in sorted(kinds):
     ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
     if k == 'x18':
         m = ins.mnemonic
+        if WINDOWS:
+            sp_mem = next((op.mem for op in ins.operands if op.type == ARM64_OP_MEM and ins.reg_name(op.mem.base) == 'sp'), None)
+            delta = sp_delta(ins) if sp_mem and ins.writeback else 0
+            # Only aligned, fixed writeback with known pre/post addressing can use a separate spill frame.
+            if sp_mem and ins.writeback and delta and -480 <= delta <= 512 and delta % 16 == 0 and not sp_mem.index:
+                put_branch(a, site_win_stack_writeback(ins, delta)); stat('win_stack_writeback'); continue
+            if re.match(r'(sp|wsp),', ins.op_str) or casp_pair18(ins) or (sp_mem and
+                    (ins.writeback or sp_mem.disp < 0 or sp_mem.index)):
+                sys.exit(f'[RED] Windows ARM64 prototype cannot rewrite {a:#x}: {m} {ins.op_str}')
         if m == 'br' and a in tailcalls: st = site_br_call(ins); stat('br_call')
         elif m == 'br': st = site_br_tab(ins, tabjumps[a]) if a in tabjumps else site_br(ins, *jumps[a]); stat('br')
         elif m in ('cbz', 'cbnz', 'tbz', 'tbnz'): st = site_cond(ins); stat('cond')
@@ -1910,7 +1969,7 @@ if os.environ.get('DM_SPIN_LIST'):
     for T, bes, n in spin_sites: print(f'{NAME} spin wait {T:#x} ({n} instructions), back-edges ' + ' '.join(f'{b:#x}' for b in bes))
 
 os.makedirs(outdir, exist_ok=True)
-P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
+P = lambda ext: os.path.join(outdir, f'{OUTPUT_NAME}.{ext}')
 patch = patch_front
 BACK_LEN = (len(patch_back) + 0x3FFF) & ~0x3FFF
 if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area (TWO: the front area padded to 16K, then the back area, padded to 16K)
@@ -1951,9 +2010,10 @@ def movie_native_color_keys():
     target = page[1].imm + low[2].imm
     return RO_OFF <= target < DATA_OFF and IMG[target:target + len(key)] == key
 
-with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:   # the same for every module: the rewriter and every patch file, by path from dm/tools
+with open(os.path.join(outdir, 'build_src.winarm64.sha256' if WINDOWS else 'build_src.sha256'), 'w') as f:   # the same for every module: the rewriter and every patch file, by path from dm/tools
     for src_ in (os.path.abspath(__file__), nso.__file__, nso_code.__file__, nso_asm.__file__, nso_syms.__file__, ue_cvar.__file__, ue_malloc.__file__, fps_target.__file__, monolith_fps.__file__, ue_fixed_rate.__file__, unity_fps.__file__, unity_bucket.__file__, ue_region.__file__, ue_ring.__file__, snowdrop_pools.__file__, os.path.join(os.path.dirname(ue_malloc.__file__), 'loader_census.py'), *PATCH_FILES): f.write(hashlib.sha256(open(src_, 'rb').read()).hexdigest() + f'  {os.path.relpath(os.path.abspath(src_), os.path.dirname(os.path.abspath(__file__)))}\n')
 with open(P('fixups.tsv'), 'w') as f:
+    if WINDOWS: f.write('# TARGET\twindows-arm64\n')
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
     if TWO: f.write(f'# BACK_OFF\t{BACK_OFF:#x}\n# BACK_LEN\t{BACK_LEN:#x}\n')   # the back patch area (TWO): its offset in the image, and its length, the last bytes of the file

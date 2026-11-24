@@ -1,0 +1,7 @@
+# Layout2 solid pane (v131072). Prepared Vulkan descriptor binding:byte offsets.
+# PS: two material alpha terms and opacity scale. VS: four pane corner alpha values.
+DM_OVERLAY_VS	35514a24cf1b902d
+DM_OVERLAY_PS	1a42d67ae0db7474
+DM_OVERLAY_PS_INPUTS	1:12,28,32
+DM_OVERLAY_VS_INPUTS	2:60,76,92,108
+DM_OVERLAY_BLIT	29e3c9dd92b8a571:1

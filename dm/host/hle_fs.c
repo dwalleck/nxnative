@@ -130,29 +130,6 @@ static romfs_img *img_open(const char *path) {
     return m;
 }
 // The entry a path names in an image: each component is a binary search of its directory's children, which the packer sorted by name (bytes, a shorter prefix first)
-static int64_t img_find(const romfs_img *m, const char *rest) {
-    uint64_t k = 0;
-    while (*rest) {
-        while (*rest == '/') rest++;
-        if (!*rest) break;
-        const char *end = strchr(rest, '/'); if (!end) end = rest + strlen(rest);
-        size_t len = end - rest;
-        if (!(len == 1 && rest[0] == '.')) {
-            if (m->e[k].type) { errno = ENOTDIR; return -1; }
-            uint64_t lo = m->e[k].a, hi = lo + m->e[k].b; int found = 0;
-            while (lo < hi) {
-                uint64_t mid = lo + (hi - lo) / 2; const img_ent *x = &m->e[mid];
-                int c = memcmp(m->names + x->name, rest, x->nlen < len ? x->nlen : len);
-                if (!c) c = (x->nlen > len) - (x->nlen < len);
-                if (!c) { k = mid; found = 1; break; }
-                if (c < 0) lo = mid + 1; else hi = mid;
-            }
-            if (!found) { errno = ENOENT; return -1; }
-        }
-        rest = end;
-    }
-    return (int64_t)k;
-}
 // Horizon's file system accessor turns each backslash in a path into a slash before it normalizes the path (FileSystemAccessor::SetUpPath, InitializeWithReplaceBackslash),
 // on every mount but the PC host's: Metroid Prime 4 (SDK 19) names its RomFS files rom:\StartupUI.pak. Each guest path resolver takes p through here first: p itself, or
 // its copy in buf with slashes (a path too long for buf is left as it is, and is not found)
@@ -173,7 +150,7 @@ static int img_path(const char *p, int *mi, int64_t *k) {
         char normed[1024]; const char *rest = c + 1; *mi = i;
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) { *k = -1; return 1; } rest = normed; }
         char ov[1024]; if (g_mnt[i].overlay[0] && rom_overlay_path(&g_mnt[i], rest, ov, sizeof ov)) return 0;
-        *k = img_find(g_mnt[i].img, rest); return 1;
+        *k = romfs_image_find(g_mnt[i].img, rest); return 1;
     }
     return 0;
 }
@@ -1354,7 +1331,7 @@ static int dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
         err = errno; closedir(x);
         if (err) goto done;
     }
-    int64_t dk = m->img ? img_find(m->img, rest) : -1;
+    int64_t dk = m->img ? romfs_image_find(m->img, rest) : -1;
     if (dk >= 0 && !m->img->e[dk].type)   // the image's own entries of this directory, after the overlay folders'
         for (uint64_t j = 0; j < m->img->e[dk].b; j++) {
             const img_ent *c = &m->img->e[m->img->e[dk].a + j]; size_t l = c->nlen < 0x300 ? c->nlen : 0x300;
@@ -1370,7 +1347,7 @@ static int dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
         snprintf(rel, 2048, "%s/%s", rest, names[j]);
         struct stat st; int64_t k;
         if (rom_overlay_path(m, rel, resolved, 1024)) { if (!stat(resolved, &st)) { h->snap[j].type = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; h->snap[j].size = S_ISDIR(st.st_mode) ? 0 : st.st_size; } }
-        else if (m->img && (k = img_find(m->img, rel)) >= 0) { h->snap[j].type = m->img->e[k].type ? ENT_FILE : ENT_DIR; h->snap[j].size = m->img->e[k].type ? (int64_t)m->img->e[k].b : 0; }
+        else if (m->img && (k = romfs_image_find(m->img, rel)) >= 0) { h->snap[j].type = m->img->e[k].type ? ENT_FILE : ENT_DIR; h->snap[j].size = m->img->e[k].type ? (int64_t)m->img->e[k].b : 0; }
     }
 done:
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);

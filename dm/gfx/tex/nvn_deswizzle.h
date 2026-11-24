@@ -11,6 +11,12 @@
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch);
 // Reverse (for unit test round trips): linear src_linear → written into the corresponding level / layer of the whole-texture storage dst_storage
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch, void *dst_storage);
+// Decode or update one z slice of a level. For array/cube textures, slice
+// is 0 and layer still selects the full mip chain in guest storage.
+int nvn_deswizzle_slice(const nvn_texdesc *d, unsigned level, unsigned layer, unsigned slice,
+                        const void *src_storage, void *dst_linear, size_t dst_pitch);
+int nvn_swizzle_slice(const nvn_texdesc *d, unsigned level, unsigned layer, unsigned slice,
+                      const void *src_linear, size_t src_pitch, void *dst_storage);
 // Every step-th block of every step-th block row of a level and layer, the block in the middle of each step x step cell: nx x ny blocks into dst, rows of nx blocks (a small picture of a
 // level too large to read whole, for nvn_mtl.m's stand-ins). Block sizes of 1, 2, 4, 8 and 16 bytes; -1 for others and for what nvn_deswizzle does not support
 int nvn_deswizzle_pick(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, uint32_t step, void *dst_linear, uint32_t nx, uint32_t ny);

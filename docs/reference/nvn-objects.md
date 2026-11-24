@@ -72,6 +72,38 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Found on:** synthetic mapping and initialization tests in `t_nvn.c`; no game-specific crash is claimed.
 - **Check:** `t_nvn.c` covers both mapping entry points with a nonzero buffer offset, GPU addressing of CPU-inaccessible storage, physical backing's CPU mapping, and virtual pools before and after mapping physical pages.
 
+### Mapped memory-pool flushes in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnMemoryPoolFlushMappedRange is not implemented` during resource loading.
+- **Cause:** the production NVN2 flush entry returns without touching storage, including for `CPU_NO_ACCESS` pools. Rejecting a flush based on the pool's CPU mapping policy stopped Ocarina during environment setup.
+- **Fix:** validate the live pool and byte range without requiring a CPU mapping. Vulkan replay reads the guest backing at submission, so no separate upload is required at flush.
+- **Check:** the native graphics fixture flushes cached, uncached and CPU-inaccessible pools, including the last byte and an empty range at the end; it rejects negative offsets, overruns and oversized lengths.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Pool flags and whole-pool virtual aliases on Windows ARM64
+
+- **Symptom:** `[RED] headless NVN call: nvnMemoryPoolGetFlags is not implemented`, then `[RED] nvnMemoryPoolInitialize: virtual pools are not implemented` once graphics setup progresses.
+- **Cause:** an initialized pool keeps the builder's flags. A virtual pool starts without CPU backing, and its first whole-pool `MapVirtual` can borrow bytes from one physical pool without allocating or copying them.
+- **Fix:** read back the initialized flags and size. Accept one complete mapping at virtual offset zero, using a page-aligned range of a live physical pool on the same device. The alias has no CPU mapping and pins the physical pool's logical lifetime until finalized. It cannot supply an address or backing before mapping. Partial mappings, remapping, and unmapping require a sparse model and fail explicitly. The result is a headless storage alias, not a Vulkan mapping.
+- **Check:** the native fixture reads the pool's initialized flags after a builder reset, rejects a finalized pool, checks physical and virtual sizes before mapping, checks a nonzero physical offset and null virtual CPU map, and rejects partial mappings and early backing finalization.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Buffer address of a zeroed inline memory pool on Windows ARM64
+
+- **Symptom:** `[RED] NVN memory pool: invalid pool` when `nvnMemoryPoolGetBufferAddress` checks an inline pool before initializing it.
+- **Cause:** SDK 22.2.8's getter (`sdk+0x65e4a0` in the build below) loads the buffer address directly. The caller tests the result to decide whether to initialize its zeroed object. A live-pool tag check refused the query before that branch.
+- **Fix:** return zero for a readable, all-zero pool prefix. Invalid pointers, nonzero unrecognized prefixes and initialized virtual pools without backing still fail. Other operations still require a live pool.
+- **Check:** the native fixture queries an inline pool before initialization and rejects an otherwise identical prefix with a stray nonzero word.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Pool and buffer debug labels in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnMemoryPoolSetDebugLabel is not implemented`, followed by `[RED] headless NVN call: nvnBufferSetDebugLabel is not implemented`.
+- **Cause:** these are diagnostic labels. Both production SDK 22.2.8 entries (`sdk+0x650f80` and `sdk+0x650f50` in the build below) are bare returns, not data or object updates.
+- **Fix:** both names resolve to one Windows handler that does not dereference or retain either argument, matching production NVN2 and the Apple host. No other operations are bypassed.
+- **Check:** the native graphics fixture supplies readable and unreadable labels to the pool entry, then checks that the pool still reports its size and can be mapped.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### Heaps cut from a pool at alignment relative to its GPU address
 
 - **Symptom:** a null write as soon as the main thread starts recording a command buffer (13 Sentinels: a constructor at `main+0x2fa9a0` runs on `this = 0` when the prologue enters its first battle).
@@ -444,6 +476,62 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Fix:** the queue builder keeps each size with a set flag (`qb_set`, `qb_get` in `hle_nvn.c`); the getters answer from them, and `GetQueueMemorySize` takes the device defaults for the sizes not set, as before. The ray tracing size is kept and reported only: the host traces no rays.
 - **Found on:** [PRAGMATA](../../dm/games/0400C76024710000/README.md), which reads all four after `SetDefaults` and its setters.
 
+### Queue builder defaults in the Windows headless host
+
+- **Symptom:** startup stops at `nvnQueueBuilderSetDefaults` after registering samplers.
+- **Cause:** defaults do not create a queue or assign its effective memory sizes. SDK 22.2.8's reset preserves the device, clears the queue memory pointer, flags, sizes and their set bits, and restores priority 100 (`sdk+0x664490` in the build below).
+- **Fix:** the Windows headless builder records its options and implements this reset. The size getters distinguish an explicit zero from an unset value. `GetMemorySize` reads back the supplied storage size. `GetQueueMemorySize` computes the headless layout of the command, compute and control ranges. `QueueInitialize` uses the same layout to reject undersized, misaligned or unwritable guest storage. SDK 22.2.8 includes additional device-dependent context bytes on hardware; the headless host creates no GPU context and does not include those bytes. GPU execution and nonzero ray-tracing queue memory are not supported.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Primary queue association in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnQueueBuilderSetPrimaryQueue is not implemented` after resource loading.
+- **Cause:** NVN2 can associate a queue with an existing primary queue. The headless builder had no field for the association.
+- **Fix:** retain the primary queue from builder through initialization. Reset clears it; initialization rejects an invalid or cross-device primary and a self-reference. This records the association only: headless queues do not submit GPU work yet.
+- **Check:** the native fixture reads the association back, rejects self-association, initializes the secondary queue, and verifies reset.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Texture acquisition and presentation in the Windows headless host
+
+- **Symptom:** startup stops at `nvnWindowAcquireTexture` after setting up the window textures.
+- **Cause:** even without a GPU or a swapchain, the guest must acquire an available texture and relinquish it explicitly with a present before reusing that slot.
+- **Fix:** the Windows host uses the shared NVN layout calculator for guest-backed textures. Its logical window owns a ring of those textures, tracks which ones the guest has acquired, and retires presented slots on a 60 Hz host clock scaled by the present interval. An available texture with no pending GPU work satisfies its acquire sync. Only a valid `nvnQueuePresentTexture` increments the present count. CPU events use their guest backing word. Command recording has a [separate lifecycle](#single-segment-command-recording-on-windows-arm64); [headless upload submission](#synchronous-upload-submission-in-the-windows-headless-host) does not present a frame.
+- **Check:** the native graphics fixture tests memory sizing, exhaustion and reuse of slots, rejection of a present without an acquire, and event-word updates. Its synthetic presents do not count as game frames.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental), which acquired a texture during startup; no game present has run.
+
+### Single-segment command recording on Windows ARM64
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferBeginRecording is not implemented`, followed by `nvnCommandBufferDrawElements` once begin is available.
+- **Cause:** recording begins without taking command memory; a draw is retained state, not an immediate read of the index buffer. Ending the recording creates an opaque handle backed by control memory.
+- **Fix:** the Windows recorder tracks begin/end and memory use, stores a typed indexed-draw record in the guest-supplied command range, and returns a control record pointing to the recorded range. Handles depend on the lifetime of both guest ranges. An empty recording still takes a control record. Re-entrant begin, exhausted storage and segment changes after recording a command fail explicitly. Guest callbacks are not implemented, and Apple recording is unchanged.
+- **Check:** the native fixture checks that begin takes zero bytes, an indexed draw takes one record without dereferencing its index address, end returns a handle in the control range, and nested begin is rejected.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Synchronous upload submission in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnQueueSubmitCommands is not implemented` after recording an upload, or the corresponding stop at `nvnQueueFinish` or `nvnDeviceFinalizeCommandHandle` after submission.
+- **Cause:** recording leaves source bytes and texture backing untouched. The queue must replay commands in order, using the source bytes present at submission and the strides captured in each copy record.
+- **Fix:** `nvnQueueSubmitCommands` serializes headless submissions, checks the queue, command lists and record lengths, and executes supported copies synchronously into the texture's guest-backed storage. It shares the linear and block-linear layouts with CPU texel writes and checks source stride, bounds and backing. Supported barriers are satisfied by completion in order and the absence of GPU caches. Draw execution, unknown barrier bits, and copies requiring filtering or mirroring are not implemented. The upload neither runs shaders nor presents a frame.
+- **Completion:** `nvnQueueFinish` waits for its own queue's preceding commands and their backing writes, not scanout. An unresolved [event or sync wait](#gpu-event-waits-in-the-windows-staging-executor) also holds that queue's finish. The production NVN2 handle finalizer returns without touching the handle; the headless list has no host allocation to release.
+- **Check:** the native fixture changes source bytes after recording, checks two padded rows at their Switch 2 GOB offsets after finish and retirement, and rejects unreadable source spans, a corrupt record length and finish on an invalid queue.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### NVN2 recording modes in the Windows headless recorder
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferSetRecordingMode is not implemented` after buffer setup.
+- **Cause:** SDK 22.2.8 stores the selector at command-buffer offset `+0x18` (`sdk+0x64c430` in the build below). Some operations, such as indirect draws, use it to select native command words. Direct `DrawElements` does not. `EndRecording` has an alternate handle path for modes 3 and 4.
+- **Fix:** retain modes 0–2 on the Windows command buffer and copy the mode into a finished list. The supported direct draw uses the same portable record regardless of mode. Modes 3 and 4 and unimplemented operations still fail explicitly. No GPU words are emitted and Apple is unchanged.
+- **Check:** the native fixture finishes a mode-2 indexed draw and then an empty mode-0 list, verifies the previous list stays mode 2, and checks that modes 3 and 4 are rejected.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Barrier records in the Windows headless recorder
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferBarrier is not implemented` after selecting NVN2 recording mode 2.
+- **Cause:** a barrier adds an ordered synchronization request to the command stream. SDK 22.2.8's encoder (`sdk+0x697670`) has a mode-2 path for native words, but the Windows recorder does not emit those words.
+- **Fix:** append a typed barrier record with all 32 bits of the guest mask in stream order. As with a draw, the command must belong to an active recording and fit the supplied command memory. This preserves the request for replay; recording itself does not execute synchronization.
+- **Check:** the native fixture records a barrier after a draw, verifies the order, full mask and command span in the finished list, and rejects a barrier outside recording.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### Float blend clamp (`nvnCommandBufferSetFloatBlendClamp`)
 
 - **Symptom:** `[RED] NVN unimplemented function called: nvnCommandBufferSetFloatBlendClamp`; now `[RED] nvnCommandBufferSetFloatBlendClamp 1 (a float blend result that overflows becomes the largest finite value): Metal stores infinity`, once.
@@ -536,6 +624,22 @@ Games read this count as a position in their own command memory and size their h
 - **Note:** the game's `nu::VirtualAllocHook` / `nu::VirtualFreeHook` are undefined weak imports bound to 0 at boot, as Horizon's rtld binds them. Every one of their 6,155 call sites in Smash's `main` tests the GOT entry first, so they were not the null call.
 - **Found on:** [Super Smash Bros. Ultimate](../../dm/games/01006A800016E000/README.md#rendering) 13.0.5 on the iPhone, opening Adventure (World of Light).
 
+### Copy-stride state in the Windows headless recorder
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferSetCopyRowStride is not implemented` while preparing a buffer-to-texture upload.
+- **Cause:** the row and image strides are independent command-buffer state, in bytes. SDK 22.2.8 stores the low 32 bits at `+0x90` and `+0x94` (`sdk+0x650bd0` and `sdk+0x650be0`) and reads them back zero-extended. Neither setter emits a command.
+- **Fix:** keep each stride as a 32-bit value (zero by default for tight packing) and implement readback without consuming command or control memory. Buffer-to-texture copy records snapshot both values at recording time; the setters do not transfer data.
+- **Check:** the native fixture verifies 32-bit truncation and zero extension, independence of row and image stride, and unchanged command-memory use before the first recorded command.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Buffer-to-texture copy records in the Windows headless recorder
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferCopyBufferToTexture is not implemented` after a command buffer sets its copy strides.
+- **Cause:** the copy needs more than two addresses: it uses the selected texture subresource, flags and command-buffer strides as they were when it was recorded.
+- **Fix:** validate the destination texture, view and region; append the source address token, both strides, flags and snapshots of the texture, optional view and region in one ordered record. Recording does not read the source or modify the destination. The source bytes and destination pool remain dependencies of [headless replay](#synchronous-upload-submission-in-the-windows-headless-host).
+- **Check:** the native copy fixture resets the strides and view, clears the region, and finalizes the texture object after recording. An unreadable source is rejected only at submission. It verifies the retained values and unchanged destination bytes, and rejects a region outside the texture.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### `GetCommandMemorySize` read while another thread records
 
 - **Symptom:** `CRASH sig=11 addr=0x50` on a game thread, at `pc=main+0x385201c` in Super Smash Bros. Ultimate (`ldr x0, [x8, #0x10]` with `x8 = 0x40`), as a battle starts. Rare: it crashed on 1 of 2 battle starts in one run on a Mac mini and on none of 11 in another.
@@ -564,6 +668,13 @@ Games read this count as a position in their own command memory and size their h
 - **Waits on a sync not yet fenced:** a queue or command-buffer `WaitSync` on a sync that no fence had reached when the wait was submitted passes at once: the wait keeps the sync as it was then, and there is nothing to wait for. Parking it instead hung any game whose wait comes before its first fence of that sync. Sparking! ZERO, on a single NVN queue, waits on such a sync at its first load after the title, a wait that runs on the console. Its queue's own fence, behind the parked wait, never published. The RHI interrupt thread's `nvnSyncWait` then blocked, then the render thread and the game thread: the picture went black with sound going on, and Unreal's GPU-hang check aborted a minute later ([#1808](https://github.com/seedds/nxnative/issues/1808)).
 - **Check:** `t_wait_event` exercises public NVN calls, CPU and GPU producers, wrapping predicates, a consumer submitted before its producer, a wait on an in-flight `WRITE` (encoded before it completes) and `ADD` (parked until it lands), two signals with commands between them as one submission with a wait on the first encoded behind it, a queue and a command-buffer wait on a never-fenced sync (the work behind it runs), and logical sync lifetime. `t_queue_lifetime` checks submitted program/texture descriptor reuse and inherited queue bindings. The focused event, receipt, descriptor and lifecycle checks pass; combined gameplay and performance validation are still pending.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#open), M4 Pro. Its traced lighting producer and ambient-cache consumer have an explicit event dependency; this is a general queue contract, with no shader-key or game check in the fix. The wait on a sync not yet fenced: [DRAGON BALL Sparking! ZERO](../../dm/games/010035F022078000/README.md#found-on-this-game). The signal cuts: BioShock Infinite, which has no profile here ([#2112](https://github.com/seedds/nxnative/issues/2112)).
+
+### GPU event waits in the Windows staging executor
+
+- **Symptom:** `[RED] headless NVN call: nvnCommandBufferWaitEvent is not implemented` after a queue flush. Blocking inside submission would also deadlock a consumer whose producer is submitted next on the same CPU thread.
+- **Fix:** record the backing word, not the event descriptor. Replay checks equality or wrapping greater-or-equal; only an unresolved queue retains its remaining commands. A CPU or GPU `WRITE`/`ADD` publishes after earlier writes, including Vulkan staging readback; the executor also checks mapped event words while work is parked. Flush does not wait on dependencies. Fences, finishes and presents stay behind earlier work on their own queue. A submitted sync wait retains the fence it saw, not later fences of that sync.
+- **Limit:** staging replay completes each GPU operation synchronously. The event signal's pipeline location and the fence's condition therefore all use full preceding completion; there is no earlier GPU stage to expose. Command lists can be reused after submit, but resource backing must remain valid until its work completes.
+- **Check:** the native event fixture submits the consumer first, checks sync timeouts and refencing, reuses recording storage and the event descriptor, and releases waits via a sibling queue, CPU signal and direct mapped write.
 
 ### Bindings belong to each queue
 
@@ -669,6 +780,7 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** calculate slice and row offsets outside the segment loop and share one row copier using fixed GOB offsets and constant-size 16-byte copies. A placement sparse tile is one block row, so its decoder needs only the offset within the GOB column for each scanline. A clipped edge copies the remaining bytes and leaves the destination padding alone. ASTC blocks remain 16 bytes irrespective of their texel dimensions.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game) ([PR #261](https://github.com/seedds/nxnative/pull/261)) and [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#found-on-this-game) (placement sparse textures when loading a race).
 - **Check:** `t_tex` compares both directions against the byte-address formula for 1,029 deterministic layouts, including 1D/2D/3D, arrays/cubes, packaged block dimensions, sparse mip tails, 1/2/3/4/6/8/12/16-byte formats, padded pitches and partial segments. All 5,334 checks pass, including under AddressSanitizer and UBSan. A local arm64 Mac comparison against the old implementation, Apple clang 21 at `-O1` (the host's level then), measured 7.4–7.7 GB/s before and 35.1–37.6 GB/s after (4.6–5.1x) across 1024x1024 sparse ASTC 6x6, 2048x2048 BC7, 1920x1080 RGBA8 and 1280x720 RGBA16F. Each result is the median of seven runs copying about 128 MiB, with implementation order alternated. This is a CPU microbenchmark; no new gameplay run here.
+- **Windows ARM64:** while [Ocarina's opening](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental) played, native samples repeatedly landed in `move`. It now finishes each full 64-byte × 8-row GOB before advancing; right and bottom edges still use the clipped row copier. In eight paired N1X trials, median 2560×1440 RGBA8 deswizzle rose from 11.61 to 24.77 GiB/s in Switch 2 byte order. Both directions and orders matched an independent byte-address oracle, including pitch padding and guards. This measures CPU transfers, not game FPS.
 
 ### The Switch 2's order inside a GOB
 
@@ -762,6 +874,14 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** `WriteTexels` now records the texture, and it resolves like a packaged one: uploaded from guest memory, re-uploaded when its pages are dirtied (`mtl_tex_cpu_written`).
 - **Note:** Mario's frames got slightly brighter where materials sample the default white texture.
 - **Found on:** [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) (video frames and default textures), [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (fallback textures), Unity games (fallback textures; the source names no other).
+
+### CPU texture updates in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnTextureWriteTexels is not implemented`, then `[RED] headless NVN call: nvnTextureFlushTexels is not implemented`.
+- **Cause:** texel writes update the selected subresource in the pool's storage, not a host-owned linear image. A headless flush has no second copy to publish.
+- **Fix:** validate the view, region, source span, and backing. Write tightly packed texels in place using the shared layout and GOB address functions (or the calculated row pitch for a linear 2D texture). Reject unsupported layouts and invalid regions. Flush validates the region and backing but does not write or upload bytes.
+- **Check:** the native fixture writes a texel into an explicit mip view, checks its Switch 2 GOB byte offset, flushes the region, and rejects a write outside the level.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
 
 ### `WriteTexels` regions written in place by block-linear address
 
@@ -1129,6 +1249,41 @@ Games read this count as a position in their own command memory and size their h
 - **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md): plays as before with the new values (a 6,900-frame run at 60 fps, no red line).
 - **Note:** the switch's own constants move with the SDK (API 231.30 and GPU code minor 17 in 20.5.19; 231.39 and 20 in 21.4.4), and games check them: [Splatoon Raiders](../../dm/games/0400380020056000/README.md) requires minor 39 or more and otherwise creates no graphics system (`main+0x31b86b0`). So the host reads them from the game's own `sdk` (`dm_sdk_nvn2_item`, `loader.c`), and `g_devinfo2` holds the newest seen for what it cannot read.
 
+### NVN2 device queries in the Windows headless host
+
+- **Symptom:** startup stops at device query item 0 (API major), before allocating memory pools.
+- **Cause:** the headless host has no NVN driver. Reporting a version from the Windows GPU or using Switch 1's query table would give the wrong SDK answers.
+- **Fix:** `dm/windows/tools/nvn2_info.h` recognizes the SDK 22.2.8 switch and its static fallback by instruction pattern within the loaded SDK's text and read-only data. The host decodes constant return paths without executing guest code or using fixed module offsets. For guest shader-scratch reservations only, the headless host uses the SDK fallback's scale factors instead of live GPU factors, since it runs no shaders. Other unknown or device-dependent cases and unmatched SDK layouts stop explicitly. Successful queries do not imply support for GPU work.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Descriptor pools in the Windows headless host
+
+- **Symptom:** startup stops at `nvnSamplerPoolInitialize` after creating the backing memory pool, then at `nvnSamplerPoolRegisterSampler` when initialization is available.
+- **Symptom:** `[RED] headless NVN call: nvnTexturePoolRegisterTexture is not implemented`.
+- **Cause:** sampler and texture pools are views of caller-supplied memory, with a byte offset and an entry count. SDK 22.2.8's sampler initializer (`sdk+0x6680c0` in the build below) uses 32-byte descriptor slots and writes the first three; its texture initializer (`sdk+0x66c3e0`) writes the first texture slot. A successful init must not leave the guest with an empty object or reference storage past the end of its pool.
+- **Fix:** the Windows host records the view, checks the backing range and descriptor alignment, and takes the stride, reserved count and maximum count from the [SDK device queries](#nvn2-device-queries-in-the-windows-headless-host). Invalid views are rejected without writing the destination. Sampler builders record the SDK's defaults and parameter changes; initialization copies those values into a separate object. The sampler getters decode the retained filters, wrapping, LOD, compare mode, border color, anisotropy and reduction mode, not the mutable builder. `nvnSamplerPoolRegisterSampler` copies the sampler's state into a host-owned slot; replacing the slot writes a new snapshot. Finalizing the source sampler leaves the snapshot intact, but finalizing either pool removes its entries. Reserved and out-of-range IDs are rejected. Texture registration snapshots the texture and an optional view into its logical slot the same way. This path does not write GPU descriptors to guest memory, so overlapping views of the same descriptor kind are rejected rather than treated as independent storage. GPU replay and sampling from reserved slots remain open.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Combined texture handles in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnDeviceGetTextureHandle is not implemented` after creating an NVN2 program.
+- **Cause:** the handle encodes two descriptor indices. The SDK 22.2.8 proc table maps this name to `sdk+0x651c60` in the build below: it sign-extends both inputs, combines `texture | (sampler << 20)`, and returns zero if the texture index is zero.
+- **Fix:** validate the device and match that packing, including the null-texture rule. Do not resolve or allocate descriptors here; the command buffer selects the pools. Sampler index zero does not null a nonzero texture. Apple is unchanged.
+- **Check:** the native fixture obtains the proc dynamically before creating pools and checks the 64-bit result, both zero-index cases, and rejection of an invalid device.
+- **Sampling index zero:** the SDK initializes the reserved null texture with four zero swizzles. During Windows replay, a reflected sample of that texture uses a Vulkan null image view with a real sampler (`VK_EXT_robustness2.nullDescriptor`); the RGBA readback on N1X is `(0,0,0,0)`. This does not make a missing nonzero descriptor valid.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Texture and vertex metadata in the Windows headless host
+
+- **Symptom:** `[RED] headless NVN call: nvnTextureBuilderSetSwizzle is not implemented` or `[RED] headless NVN call: nvnTextureViewSetDefaults is not implemented` during texture setup.
+- **Symptom:** `[RED] headless NVN call: nvnVertexAttribStateSetDefaults is not implemented` during vertex layout setup.
+- **Symptom:** `[RED] headless NVN call: nvnTextureGetTarget is not implemented` during recording setup.
+- **Cause:** these calls write guest-visible state before any command buffer binds it. View overrides are distinct from texture defaults; vertex attributes and streams are compact arrays, not handles.
+- **Fix:** retain texture flags, target, channel mapping and depth/stencil mode in the initialized texture. `GetTarget` reads the target from that texture, not its mutable builder (SDK 22.2.8's getter at `sdk+0x66c300` reads the packed target field). A 16-byte view holds only the overrides set on it. Headless reports no hardware storage class, like Metal. Retain vertex format, offset, stream, stride and divisor in their four- and eight-byte slots without touching adjacent state. None of these operations issues GPU commands.
+- For dispatch sizing, `GetWidth`, `GetHeight`, `GetDepth`, `GetLevels` and `GetSamples` read the initialized descriptor as well. `GetTexelFetchHandle` packs the texture ID without a sampler ID; the command's active texture pool resolves it at submission.
+- **Check:** the native graphics fixture checks texture readback after a builder reset, including default 2D and explicit 2D-array targets, an explicit view on texture registration, and vertex-state array boundaries and packed values.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### Acceleration-structure sizing leaves a buffer address in the size output
 
 - **Symptom:** `nvnDeviceCalculateAccelerationStructureMemoryRequirements` reaches the unimplemented handler, followed by an enormous allocation and an abort while entering an RT scene.
@@ -1228,6 +1383,14 @@ Games read this count as a position in their own command memory and size their h
 - **Cause:** registering a preferred clear value populates a hardware compression cache; it does not clear a texture. SDK 20.5.29's stencil entry (`sdk+0x5d9db0`) registers the low eight bits of its integer argument in a six-entry device cache and returns whether a slot was available.
 - **Fix:** `nvnDeviceRegisterFastClearDepth` and `nvnDeviceRegisterFastClearStencil` accept the hint. Metal manages its own clear representation, and the contents still come from the recorded clear commands. The index-returning NVN2 variants are separate APIs and remain unsupported.
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) (depth), [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md) (stencil).
+
+### Legacy fast-clear color hints on Windows ARM64
+
+- **Symptom:** `[RED] headless NVN call: nvnDeviceRegisterFastClearColor is not implemented` during graphics resource setup.
+- **Cause:** the legacy boolean API asks the device to cache a color for faster clears. It does not perform a clear, and the headless device has no hardware cache.
+- **Fix:** the float, signed and unsigned color variants validate the device and the readable four-channel input, then return false: nothing was registered. No texture or device state is changed. Index-returning NVN2 variants stay unsupported.
+- **Check:** the native graphics fixture reaches the hook through dynamic lookup, checks all three boolean variants, and distinguishes an invalid pointer from the unsupported index variant.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
 
 ### SDK 8 window and copy-stride entry points
 

@@ -217,6 +217,24 @@ int main(void) {
         printf("  E 32³ RGBA16F (the shape of a 32³ color lookup table) block height/depth %u/%u, storage %llu (expected 0/4, 262144)\n", L.tileH, L.tileD, (unsigned long long)L.size);
     }
 
+    // The 64³ BC4 block encoder renders only one plane as 16×16 RGBA16UI
+    // texels. In Switch 2 GOB order, block (10,9) of slice 17 is at
+    // depth slab 32768 + row 16384 + column 8192 + slice 512 + 80.
+    {
+        const nvn_texdesc d = {2, 0x49, 0, 0, 64, 64, 64, 1, 0, 0, 1};
+        nvn_texlayout storage; nvn_tex_layout(&d, &storage);
+        uint8_t *bytes = calloc(storage.size, 1), plane[16 * 128] = {0};
+        bytes[57936] = 0xaa;
+        bytes[58448] = 0x55; // same block in z=18
+        CHECK(!nvn_deswizzle_slice(&d, 0, 0, 17, bytes, plane, 128) && plane[9 * 128 + 80] == 0xaa,
+              "E BC4 raw block read from selected slice");
+        plane[9 * 128 + 80] = 0xbb;
+        CHECK(!nvn_swizzle_slice(&d, 0, 0, 17, plane, 128, bytes) && bytes[57936] == 0xbb && bytes[58448] == 0x55,
+              "E BC4 raw block write preserves adjacent slice");
+        CHECK(nvn_deswizzle_slice(&d, 0, 0, 64, bytes, plane, 128) != 0, "E reject slice past BC4 volume");
+        free(bytes);
+    }
+
     // Packaged 32³ RGBA8: markers computed independently with block height/depth 0/0 or 2/1.
     // For byte 0x12, (20,11,3) is at depth block 8192 + column 4096 + GOB 2560 + intra-GOB 112 = 14960.
     // For byte 0x00, the same voxel is at slice 12288 + row 1024 + column 512 + intra-GOB 112 = 13936.

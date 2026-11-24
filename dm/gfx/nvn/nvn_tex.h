@@ -9,6 +9,14 @@ typedef struct {
     uint16_t gob_order;                   // Captured from the owning device: 0 = Tegra X1, 1 = Switch 2; independent of texture usage flags
 } nvn_texdesc;
 
+// Host depth caches are driver-private. Reserve guest storage by tile and layer
+// so a depth target's live allocation can never alias a zero-length block.
+static inline uint64_t nvn_zcull_reservation(const nvn_texdesc *d) {
+    uint64_t tiles = (((uint64_t)d->width + 31) / 32) * (((uint64_t)d->height + 31) / 32) *
+                     (d->depth ? d->depth : 1);
+    return tiles ? ((tiles * 8 + 255) & ~UINT64_C(255)) : 256;
+}
+
 typedef struct {
     uint64_t size, layer_size;            // Total storage bytes, bytes per layer
     uint32_t align, layers, bpb;          // Alignment, layer count, bytes per block

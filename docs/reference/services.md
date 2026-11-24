@@ -12,6 +12,71 @@ SDK calls and system services the host answers (`dm/host/hle_*.c`). Each entry: 
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md) (SDK 18): `nn::hid::InitializeTouchScreen(int, int)`, the SDK 18 overload of the hooked `InitializeTouchScreen()`; [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (SDK 7): `account::OpenPreselectedUser`, then `bcat::Initialize`, then `audio::AcquireAudioDeviceSwitchNotification`, and a null read in `account::GetLastOpenedUser`.
 - **Note:** the same abort from other services: `ec::InitializeForShopServiceAccessors` ([Shop service accessors](#shop-service-accessors)), `pctl::IsFreeCommunicationAvailable` ([Parental controls and free communication](#parental-controls-and-free-communication)), `oe::FinishStartupLogo` ([The startup logo](#the-startup-logo)), `hid::VibrationNode::Update` ([Vibration values flushed by the SDK's vibration graph](#vibration-values-flushed-by-the-sdks-vibration-graph)), `audio::GetAudioDeviceOutputVolume` ([Audio device output volume and names](audio.md#audio-device-output-volume-and-names)), `capsrv::InitializeForApplication` ([Album calls fail with no album](#album-calls-fail-with-no-album)), `settings::LanguageCode` ([Language codes](#language-codes)), and the rest of this file.
 
+### Native service-manager sessions on Windows ARM64
+
+- **Symptom:** a native SDK service client stops at `svcConnectToNamedPort("sm:")`.
+- **Cause:** service clients that still run in the guest open the `sm:` port directly. SDK 22.2.8 sends `RegisterClient` as TIPC type `0x10` with a PID descriptor and `GetServiceHandle` as type `0x11`.
+- **Fix:** `dm/windows/tools/m3_ipc.c` reads and replies in the caller's 256-byte ThreadLocalRegion command buffer. It validates headers and distinguishes SVC errors from SM results. Unimplemented services return `ResultNotRegistered` (`0xe15`), not a dummy handle. Account startup now runs above this boundary.
+- **Check:** the native M2 fixture checks registration, malformed packets, a result without a moved handle, closure, and rejection of a stale handle.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Local account startup without control data on Windows ARM64
+
+- **Symptom:** `nn::account::Initialize` fails in `acc:u0` command 150 when a valid game bundle has no `control.nacp`.
+- **Cause:** the native SDK 22.2.8 path initializes application info (domain command 160, `sdk+0x1b6ce0`) and asks Horizon for `IsUserAccountSwitchLocked` (domain command 150, `sdk+0x1b6cd0`). The experimental IPC path depended on optional title metadata even though the headless launcher owns its user selection.
+- **Fix:** take over the SDK account imports at the same boundary as `dm/host/hle_account.c`. The headless host exposes one local launch user with the same UID and `DM_NICK` convention. Opens get separate session tokens; closing one does not close another. A network-account availability check returns the same offline cancellation as Apple. The host does not register `acc:u0` or guess the cartridge's switch policy. Multiple users and network sign-in are out of scope for this host.
+- **Check:** the native M3 fixture exercises these imports without `control.nacp` or service-manager IPC.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Transactional save mounts on Windows ARM64
+
+- **Symptom:** the SDK reaches `fsp-srv` from `fs::MountSaveData` after audio initialization rather than mounting the launch user's save.
+- **Cause:** the read-only RomFS image cannot serve a writable user archive. Flushing a file must not publish the whole filesystem transaction.
+- **Fix:** route the filesystem imports by mount. The Windows host opens the user's WinSQLite store under `DM_SAVE`, and uses an independent in-memory store for temporary storage. Explicit filesystem commit publishes changes; closing a file, flushing it or abandoning the process does not. RomFS stays read-only.
+- **Check:** `WindowsHost.test_native_save_transactions` writes, flushes, commits, remounts, and reopens in another process. It checks both persisted bytes and rollback after a dirty writer exits.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### An empty applet launch-parameter channel on Windows ARM64
+
+- **Symptom:** after account initialization, `TryPopFromApplicationParameterChannel` dereferences a null applet proxy (`sdk+0x1e0cc8` in the build below).
+- **Cause:** the SDK asks for a preselected-user launch payload, but the direct headless launch has no applet sender or user selection.
+- **Fix:** answer the SDK's try-pop import with its empty-channel result (`false`, output storage unchanged) for user-channel and preselected-user requests. Do not create a storage object or pretend a user was selected. The native M3 fixture checks the unchanged output.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Headless Npad initialization on Windows ARM64
+
+- **Symptom:** `nn::hid::InitializeNpad` stops at `[RED] sm: service 'hid' is not registered` on the Windows host.
+- **Cause:** the native SDK import opens the Horizon service to initialize the application's controller state. The headless host has neither a HID service nor an input source.
+- **Fix:** initialize Npad at the SDK import boundary, as the Apple host does. The windowed host reports one FullKey controller on a supported player ID, from XInput or the opt-in focused [keyboard fallback](../port-windows-arm64.md#resume-the-windows-bring-up-loop). History contains only samples actually read from that source, newest first. Headless or with no eligible device, the active style is zero and history calls leave the sample buffer untouched. Controller Support reports the available controller if it meets the requested count, otherwise returns the SDK's cancellation result without a selection.
+- `DisconnectNpad` clears the assigned guest slot and its history without disconnecting the Windows device. An unplug/replug, renewed keyboard focus, or Controller Support can assign it again. Unassigned slots are unchanged.
+- The Windows backend exposes no motion or vibration handles. In Ocarina of Time v131072, the guest reads these counts with a capacity of two; without a six-axis handle, it takes the branch at `main+0x346988c` past sensor setup.
+- Mouse history is empty without a pointing device. Keyboard polling returns a disconnected, zeroed SDK state, not an unmodified caller buffer. The native HID fixture checks both contracts at the import boundary.
+- **Check:** the native M3 fixture verifies configuration survives initialization, all five state overloads and all three peripheral enumerations leave empty output buffers intact, Controller Support returns canceled with untouched result storage, and an invalid ID is rejected.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Monotonic time before the Horizon time service on Windows
+
+- **Symptom:** `std::chrono::steady_clock::now()` throws `std::system_error` on a guest worker. The visible fault may be in the game's allocator while constructing the exception.
+- **Cause:** the SDK's `clock_gettime(CLOCK_MONOTONIC)` converts a failing `nn::time::GetStandardSteadyClockCurrentTimespec` to `EAGAIN`. This clock must work without a Horizon time-service session; a wall clock is not a substitute.
+- **Fix:** supply the SDK steady-clock import from `QueryInterruptTimePrecise`, converting its 100 ns monotonic ticks to normalized seconds and nanoseconds.
+- **Check:** the native kernel fixture reads the clock on both sides of a guest sleep and checks its output. It also rejects an output pointer into a decommitted heap.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Windows RomFS imports before SDK service dispatch
+
+- **Symptom:** on the experimental Windows host, `nn::fs::QueryMountRomCacheSize` reaches `svcConnectToNamedPort` (0x1F) while opening the unavailable `fsp-srv` proxy.
+- **Cause:** like the Apple host, the Windows host supplies no Horizon filesystem service process. The cache-size query itself enters the SDK's access-log path before the first file is opened.
+- **Fix:** use the existing SDK import seam for the cache query, mount and basic read-only calls. Windows import thunks switch to the native thread stack before entering C. `romfs_image.h` reuses the same `DMROMFS1` index checks and file lookup on both hosts; Windows uses a locked seek/read on a private Win32 handle. Guest file names are looked up in the image rather than passed to Win32 as paths. Writable mounts are not implemented in this host.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental); the native Windows fixture also checks exact-read failure, short reads, malformed indexes and closed handles.
+
+### Filesystem priority on direct Windows RomFS reads
+
+- **Symptom:** a Windows resource worker stops at `[RED] sm: service 'fsp-srv' is not registered` even though the RomFS is already mounted and readable.
+- **Cause:** the SDK's `nn::fs::SetPriorityOnCurrentThread` checks filesystem access logging through the Horizon proxy before setting its per-thread request priority. This is an I/O hint, not a CPU priority change. The direct RomFS path has no proxy or daemon queue.
+- **Fix:** handle the setter at the same import boundary as the Apple host. Validate the SDK priority (0–2) and retain it per thread for `DM_FS` read traces. Direct reads are synchronous and the hint does not change their ordering.
+- **Check:** the native M3 fixture sets priority `2` and reads the image without opening an IPC session.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### SDK 3.6.0 answered as SDK 4
 
 - SDK 3.6.0 booted to its frame loop with the provisional profile as generated and no host change: the services, the NVN API version (53, as for every SDK up to 10), the audio output and the heap all answered as for SDK 4.
@@ -389,6 +454,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `t_save_sync_metadata` injects open, write, close and rename failures into the production writer, including simultaneous write/close failures and cleanup changing `errno`. It checks descriptor closure, preservation of existing metadata, diagnostics and a successful replacement. No cloud service or gameplay validation is claimed.
 
 ## Add-on content
+
+### Add-on enumeration in the base-only Windows host
+
+- **Symptom:** `nn::aoc::CountAddOnContent` dereferences a null service proxy on Windows ARM64.
+- **Cause:** the SDK count/list imports expect a Horizon add-on service. The headless Windows launcher mounts only the main RomFS and does not initialize that proxy.
+- **Fix:** answer the count and list at the SDK import boundary. With no add-ons configured, both return zero and the list call leaves its output unchanged. A nonempty `DM_AOC_DIR` is explicitly rejected; Windows add-on mounting is not implemented.
+- **Check:** the native M3 fixture checks the empty count and list, unchanged output, and rejection of a configured directory.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
 
 ### Add-on content from `DM_AOC_DIR`
 
@@ -1614,6 +1687,7 @@ Most service calls can be found before they crash, before the first boot or the 
   - `time::ClockSnapshot::CreateWithStandardSystemClock` and `CreateWithAdjustableSystemClock`: 0xD0 bytes, filled on the host from the steady clock, the user clock and the calendar; the network fields are the user clock's, as the network clock is ([Time zone rules, calendar conversion and the network clock](#time-zone-rules-calendar-conversion-and-the-network-clock)), so two host snapshots take their span from their steady time points and one made on a Switch from the network times. The type byte at `+0xcd` is 1 for standard and 2 for adjustable snapshots (0 means uninitialized), as verified in [Tears of the Kingdom's SDK](../../dm/games/0100F2C0115B6000/README.md#services). The adjustable entry also dereferences the absent time-service session without a host take-over. `t_time` checks both registrations, guarded buffers, the adjustable calendar and location, and snapshot arithmetic. The adjustable crash and boot fix were reported for Tomodachi Life: Living the Dream in [PR #385](https://github.com/seedds/nxnative/pull/385); that gameplay report has not been repeated here.
   - The adjustable user clock (`time::AdjustableUserSystemClock::GetCurrentTime`, which the game's days follow) reads the time service's shared memory in the SDK (`MonotonicSystemClock::GetCurrentTime`, `sdk+0x4421cc`), which the host never maps, so it is the host's clock, as the user clock; `time::GetStandardSteadyClockCurrentTimePoint`, the free-function form of the steady clock ([Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) SDK 20.5.4, found in `main`'s imports before the first boot).
   - `time::StandardSteadyClock::now()`, the C++ clock form: a time point of seconds in `x0`. The SDK asks the steady-clock session `time::Initialize` opens and returns 0 without one (SDK 3.7.0, `sdk+0x16edf4` in [Mega Man Legacy Collection](../../dm/games/01002D4007AE0000/README.md), which calls it from six sites in `main`); the host takes over `Initialize` and opens none, so the clock never moved. It is the host's monotonic seconds, as `GetCurrentTimePoint`. Reported in [PR #2729](https://github.com/seedds/nxnative/pull/2729).
+  - On Windows, [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental) takes a standard snapshot while starting its title scene. `m3_time.inc` records the host wall clock and calendar alongside a process-local steady source. The native kernel fixture checks both comparison paths: the steady delta for a matching source, and the network delta when the source IDs differ.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md), [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md), [Mega Man Legacy Collection](../../dm/games/01002D4007AE0000/README.md).
 
 ### A game restart reports a user clock change

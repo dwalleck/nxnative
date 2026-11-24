@@ -12,6 +12,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[3]
 SOURCE = REPO / 'dm/tools/patch_nso.py'
+requires_fork = unittest.skipUnless(hasattr(signal, 'pthread_sigmask'), 'requires POSIX fork and signal masks')
 
 
 def alive(pid):
@@ -46,6 +47,7 @@ class RewriteWorkers(unittest.TestCase):
                 self.assertIn('[RED] DM_REWRITE_J must be a positive integer', r.stderr)
                 self.assertNotIn('Traceback', r.stderr)
 
+    @requires_fork
     def test_sigterm_reaps_the_active_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -65,6 +67,7 @@ class RewriteWorkers(unittest.TestCase):
                 except ProcessLookupError: pass
                 p.communicate(timeout=5)
 
+    @requires_fork
     def test_workers_cannot_lose_the_pool_sigterm(self):
         # Pool.terminate's one SIGTERM must end a worker wherever it lands. A worker with the rewriter's Python handler could lose it while starting and hang the rewrite in about 1 of 6,000
         # small pools under load, too rare and too slow to catch by repeating them. So check what rules it out: blocked from the fork on, then the default action, unblocked, before any job.
@@ -84,6 +87,7 @@ print(json.dumps({'workers': results, 'parent_blocked': TERM in signal.pthread_s
         self.assertEqual(got['workers'], [[True, True, False]] * 2)
         self.assertEqual((got['parent_blocked'], got['parent_handler']), (False, True))
 
+    @requires_fork
     def test_sigterm_during_teardown_waits_for_it_to_finish(self):
         # raised inside Pool.terminate, the handler's sys.exit would stop it halfway: it must act once the pool is gone
         script = pool_helper() + '''
@@ -103,6 +107,7 @@ print('carried on', flush=True)
         self.assertIn('terminated', r.stdout)
         self.assertNotIn('carried on', r.stdout)
 
+    @requires_fork
     def test_sigterm_during_pool_start_reaps_the_workers(self):
         # a SIGTERM that arrives while the mask is on takes effect once the pool exists, and still goes through its context manager
         script = pool_helper() + '''

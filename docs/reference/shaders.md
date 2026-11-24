@@ -915,6 +915,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 - **Missing control sections (resolved, found by clang-tidy):** `prog_key` must return the hash failure without marking a cached key valid. Previously a serial-less stage returned success with uninitialized output, and a serial-backed stage cached a zero key. Resolution and prefetch now stop with a fatal diagnostic rather than reading an invalid key; `t_nvn` checks both forms and a successful retry after supplying a control section. No game failure was observed.
 
+### NVN2 program identities on Windows ARM64
+
+- **Symptom:** `[RED] headless NVN call: nvnProgramInitializeFromBuilder is not implemented` during resource loading.
+- **Cause:** the NVN2 builder borrows the shader data array and control pointers. The initialized program must keep its shader identities after the caller reuses that data, including when the guest copies a program by value.
+- **Fix:** validate the control marker, version, declared spans and unique stages before publishing the program. For the stage, read the NVN2 control byte for compute, task or mesh when present; graphics uses the SPH. Hash the first 0x48 control bytes with +0x30 zeroed, then the code area, matching the offline keys. Retain only the stage mask and per-stage key prefixes with the device in the program. This requires readable, already mapped code and does not compile, bind or execute it. Ray-tracing programs remain unsupported.
+- **Check:** the native program fixture compares the retained keys with independently computed SHA-256 prefixes, resets the builder and clears its shader array, and tests rejection of a bad marker, unreadable or oversized code, and duplicate stages without publishing the destination.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### Control sections shared among shaders that differ only in their compile information
 
 - **Symptom:** `[RED] shader … is not in the shader map` for shaders whose control section and code area are both in the game files, but in different records: dumped (`DM_NVN_SHDUMP`), the control section is one record's and the code area another's.
@@ -1215,6 +1223,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 ### Integer textures and images through float declarations keep their bits
 
 - These accesses kept their integer bits on the Apple GPU used in the original check. Metal leaves a mismatch between texture format and shader type undefined. The host adapts supported 32-bit integer buffer image formats to matching float views. See [Float views for integer buffer images](rendering.md#float-views-for-integer-buffer-images).
+- **Windows Vulkan:** for a fixed combined sampler bound to an integer view, replay specializes that binding’s SPIR-V image type, uses an integer fetch/sample/gather and bitcasts the result back to the guest register type. Other bindings sharing the original float declaration are unchanged. A mixed bindless array is not covered. On N1X, alternating unsigned, signed and float views in one pipeline fixture preserved the sampled bits; signed `RG16I` results sign-extended to 32 bits.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the volumetric lightmap's indirection texture, the light grid buffers).
 
 ### Integer-typed vertex inputs fed normalized formats
@@ -1669,6 +1678,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 ## Bindings and handles
 
 - **Note:** the layout of NVN's driver segments `c0` and `c2` (the handle tables, the storage and uniform buffer tables, the words the host fills) and the binding kinds of the reflection JSON have one definition, `dm/gfx/nvn/dmsh_abi.h`. The host includes it (`nvn_mtl.m`, `nvn_refl.m`, `nvn_obj.h`); `dmsh_build.py` reads it through `dm/gfx/tools/dmsh_abi.py`, which stops on any line it cannot read. Both files are part of the chain version. `dm/tools/tests/test_dmsh_abi.py` checks that the tables fit together, that the host converts every kind the build may write, that the translator's own copy of the `c2` layout (`Program.cs`) agrees, and that the values do not come back as literals in the host or the build. The entries below cite the offsets.
+
+### Binding zero in a compact Windows Vulkan shader
+
+- **Symptom:** the Windows loader reports `could not load VS ... (VkResult -8)` even though the requested SPIR-V and reflection exist and agree on the binding types.
+- **Cause:** after dead-variable elimination removes an unused support uniform buffer, compact descriptor numbering can place an ordinary storage buffer at zero. The host treated zero as proof of a support buffer.
+- **Fix:** use the reflected resource source and descriptor type. A support buffer, if present, must still be a single uniform buffer at binding zero.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
 
 ### Images and buffer textures with their handle in a uniform buffer
 
@@ -2331,6 +2347,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `dm/gfx/tests/test_ndve_engine.py`: every kernel on random inputs and weights at the network's sizes, bit for bit against references that call `dmsh_hmma16816_f16` as `hmma_msl` rewrites it, in PTX's fragment layout with TensorPass's chain flags (all 10 identical on an M1 Pro, an M5 Max and an M4 Pro; with an f32 accumulator per HMMA instead, the 9 with HMMAs differ in 6-25 % of their outputs), and the weight offsets the layer table gives against those Ocarina of Time binds. Standalone on one title-movie frame on the M1 Pro (16 GPU cores): main's 13 translated dispatches 36.3 ms of GPU, the host's 13 kernels 10.8 ms (PR #1894). In the game, on an M4 Pro with 20 GPU cores (Ocarina of Time's `title-movie` route, `scripts/bench.py`, three runs each, the window kept in focus): the frame's GPU time 12.78 ms with `DM_NDVE_ENGINE=0`, 6.77 with the host's network (p50), both at 60 fps. `DM_NDVE_ENGINE=check` runs the game's dispatches and the host's network and resampler beside them into images of its own and compares them texel by texel (logged every 300 frames): over 1,500 title frames, the resampler identical in every frame, the network in all but 10 texels, each 1/1023 off, the same 10 with `DM_NVN_ENC_THREAD=1`. The translated shaders are built with Metal's fast math, which may contract and reorder those sums: `5a7d69b0` built with `-fno-fast-math` instead gives other bits in a few texels of random inputs; the host's kernels keep the game's order.
 - **Note:** run standalone on fixed inputs, 4 times each, the 10 translated dispatches gave the same output every time on an M4 Pro, on chain `dedc9391c30b` and on `39417042cfe8` ([issue 1893](https://github.com/seedds/nxnative/issues/1893) reported outputs that change from run to run on an M1 Pro, measured by another harness; not reproduced).
 - **Note:** the host's network rounds each HMMA's f16 accumulator once per 8 products, as the translated helper does since [HMMA rounds its f16 accumulator once per 8 products](#hmma-rounds-its-f16-accumulator-once-per-8-products) (resolved; before that both rounded after every product, as `simdgroup_half8x8` does, and differed from the Switch in the low bits of most HMMAs). The host's network follows the helper, and `test_ndve_engine.py` fails when the two differ.
+- **Windows Vulkan:** the [offline title library](../port-windows-arm64.md#build-the-offline-shader-library) translates the model's own compute shaders. The guest selects the program, bindings and dispatch dimensions. Synchronous replay uploads the decoder planes, dispatches the translated shaders on a 32-lane subgroup and writes storage images and buffers back before the next guest command uses them. This is not the Metal replacement network.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate): its title and opening movies ([issue 1375](https://github.com/seedds/nxnative/issues/1375), PR #1894).
 
 ### An interrupted compute compile broke the NDVE sequence
@@ -2763,6 +2780,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** Metal runs texture atomics only on R32Uint and R32Sint textures and views. NVN lets a shader run them through an R32 view of any 32-bit colour texture: agl's anti-aliasing (`d17eefaff4f0bc23`) ORs its blend weights into RGBA8 that way, then reads it as RGBA8.
 - **Fix:** `nvn_mtl.m` `tex_upgrade`, `tex_atomic_alias`: at the first such dispatch the texture moves to R32 storage holding the same bytes, and its own format becomes a view of that storage for sampling, rendering and copies. Packaged, multisampled, 3D and buffer-backed textures keep their storage. The design is [PR 1312](https://github.com/seedds/nxnative/pull/1312)'s.
 - **Check:** `make -C dm/gfx/tests GAME=0400486024DEC000 check_t_image_alias`.
+- **Windows Vulkan:** when a reflected R32 integer storage variable is used by `OpImageTexelPointer`, stage the original four-byte colour texels as R32, require Vulkan storage-image atomic support, then write the resulting words back through the original NVN layout. A native gather-and-OR fixture checked the result in the tiled RGBA8 backing.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 
 ### Bounds of image atomics

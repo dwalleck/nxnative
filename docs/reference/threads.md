@@ -64,6 +64,16 @@ Guest threads, their synchronization and how the host schedules them. Each entry
 - **Check:** `t_sync_wait` closed-unstarted: 24 real `CreateThread` / `CloseHandle` pairs return the object count and `thr_limit_used` to where they were (under ASan and TSan); before, they stayed 24 higher.
 - **Found on:** a code audit, with host unit tests; no game failure is known.
 
+### Guest worker lifecycle on Windows ARM64
+
+- **Symptom:** after moving the first worker stack, the Windows host stops at `svcCreateThread` (`0x8`). Rejecting the process's later `SetThreadCoreMask` with `0xd201` also aborts startup if the host advertises only three cores for Ounce.
+- **Cause:** startup needs a dormant thread handle before the worker is runnable, and the SDK expects each running thread to have its own TLS, kernel ID and current-thread record. The original Switch and Switch 2 application core masks differ.
+- **Fix:** `dm/windows/tools/m2_host.c` binds a free guest handle to the mapped stack at `CreateThread`. `StartThread` launches a native ARM64 thread, initializes its own PE TLS slots and guest TLS/ThreadLocalRegion, then enters the guest on its mapped stack. SVC dispatch switches to that worker's native stack. Thread-object and stack-map operations share a lock; a wait retains the original objects and releases the lock while blocked. An exited worker signals waiters and releases its guest TLS. Closing a dormant handle runs no native thread. Ounce profiles report six logical application cores, independent of the Windows CPU count.
+- A reentrant SDK call can arrive on a guest fiber stack rather than the thread's original mapped stack. The Windows call gate checks the actual writable spill frame below the current guest SP; it must not require that SP to belong to the kernel-created stack. The native reentrant-call fixture switches to a separate writable frame before a nested call.
+- **Limits:** waits accept thread handles only. Core masks and priorities are guest bookkeeping, not native affinity or Horizon scheduling; priority handoffs, mutex/condition-variable arbitration, cancellation and stack creation without a prior stack move remain open.
+- **Check:** the Windows M2 fixture verifies dormant polling, stack pinning, independent `x18` and TLS, current-thread identity, worker exit/wait, duplicate-start rejection and unstarted-handle cleanup.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
 ### Pausing threads and reading their context for garbage collectors
 
 - **Symptom:** in garbage-collected titles (Unity / IL2CPP), live objects freed, with their finalizers releasing native resources.
@@ -159,6 +169,30 @@ Guest threads, their synchronization and how the host schedules them. Each entry
 - **Found on:** the [static-analysis audit in issue #313](https://github.com/seedds/nxnative/issues/313#issuecomment-6543080671), reproduced with synthetic paths; no game-specific failure is claimed.
 
 ## Synchronization and address arbitration
+
+### Address wait and wake on Windows ARM64
+
+- **Symptom:** the first Windows guest worker stops at `WaitForAddress` (`svc 0x34`).
+- **Cause:** SDK 22 waits indefinitely while a 32-bit synchronization word equals `1`; the Windows host initially supported waits on thread handles only. A separate `SignalToAddress` call can change the guest word and wake the queued thread.
+- **Fix:** check the guest predicate and enqueue the waiter under the Windows SVC lock. Use native condition variables that release the lock while blocked, and atomic compare/exchange for updates that race user-mode stores. A signal selects waiters on its address by guest priority, FIFO for ties. Positive timeouts use the native condition variable's millisecond granularity; no Horizon scheduler handoff is implied.
+- **Check:** the M2 fixture covers mismatched predicates, zero and finite timeouts, 32- vs 64-bit comparisons, the type-2 update with and without waiters, and actual cross-thread wakeup that ignores a neighboring address.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Contended mutex handoff on Windows ARM64
+
+- **Symptom:** concurrent guest workers stop at `ArbitrateLock` or `ArbitrateUnlock` (`svc 0x1a`/`0x1b`).
+- **Cause:** the SDK sets bit `0x40000000` in a user-mode mutex word before entering the kernel. The remaining bits hold the guest owner tag: SDK 22 uses the thread ID, which is different from its open handle. The Windows host only handled address wait/wake, not mutex ownership transfer.
+- **Fix:** queue only while the full word still matches the supplied owner plus the waiter bit; if release won the race, let the SDK retry. On unlock, release-store the next waiter's tag before waking it, retaining the waiter bit if others remain. Mutex and address waits have separate queues; both select by guest priority, then FIFO. Native priority inheritance and Horizon scheduler handoff are not implemented.
+- **Check:** the M2 fixture checks the stale-owner path and a two-thread critical section; the game also reaches later work after real contention.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
+
+### Process-wide condition keys on Windows ARM64
+
+- **Symptom:** a guest worker stops at `WaitProcessWideKeyAtomic` (`svc 0x1c`) with other threads still loading resources.
+- **Cause:** the SDK expects the kernel to register a condition waiter and release its guest mutex atomically. Waking the worker without also transferring or reacquiring the mutex violates the SDK contract.
+- **Fix:** under the SVC lock, mark the condition key and release the mutex. On signal (`svc 0x1d`), give an uncontended mutex to the selected waiter; if another thread owns it, queue the waiter for mutex handoff. After signal, the condition timeout no longer applies.
+- **Check:** the native M2 fixture signals while holding the mutex and verifies ownership after the worker returns.
+- **Found on:** [Ocarina of Time, Windows ARM64](../../dm/games/0400486024DEC000/README.md#windows-arm64-bring-up-experimental).
 
 ### Wakes signalled after the scheduler lock is let go
 
