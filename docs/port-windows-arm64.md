@@ -4,7 +4,7 @@
 
 The question it answers: this project runs a Switch game's own AArch64 code natively on Apple silicon, and stands in for the Horizon kernel and the SDK's services. Could the same approach work on an NVIDIA N1X-class laptop — Arm cores, a Blackwell GPU, unified LPDDR5X, Windows on Arm — and would Windows' Prism emulation help?
 
-Short answer: **use a native ARM64 host, not Prism.** [M0](#m0--toolchain-and-target-check) verified native Vulkan on the RTX Spark N1X. [M1](#m1--the-rewriters-windows-variant) runs rewritten AArch64 code, [M2](#m2--boot-to-the-games-entry-point) reaches Ocarina's `nnMain`, and [M3](#m3--services-input-audio-and-a-frame-loop-with-no-gpu) services the active game. [M4](#m4--the-vulkan-replay-backend) executes indexed draws from the game and presents its textures in a Win32 window.
+Short answer: **use a native ARM64 host, not Prism.** [M0](#m0--toolchain-and-target-check) verified native Vulkan on the RTX Spark N1X. [M1](#m1--the-rewriters-windows-variant) runs rewritten AArch64 code, [M2](#m2--boot-to-the-games-entry-point) reaches Ocarina's `nnMain`, and [M3](#m3--services-input-audio-and-a-frame-loop-with-no-gpu) services the active game. [M4](#m4--the-vulkan-replay-backend) executes indexed draws from the game and presents its textures in a Win32 window. What another machine can and cannot continue while the N1X is away is in [Machines](#machines-what-runs-where).
 
 ## What the current architecture is
 
@@ -490,6 +490,29 @@ For a windowed run, set `DM_CAPTURE_DIR` to an existing, writable directory rese
 - `scripts/regress.py check --games` on the games it can run, with the report naming the games and why ([dev loop](agents/06-dev-loop.md)).
 - Every general mechanism found during the port becomes an entry in its `docs/reference/<subsystem>.md`, with the platform it was found on, and `dm/tools/docs_symptoms.py` regenerates the index. Game-specific facts go into the game's note, in the section they belong to.
 - A platform column would be needed in the games table before any row could claim Windows support.
+
+## Machines: what runs where
+
+The CPU side is vendor-neutral: any AArch64 Windows machine with the ARM64 build tools runs the rewriter, the host, services, input, audio, the save path, [`check-windows-native.py`](../scripts/check-windows-native.py), the checkpoint runner and the offline shader translation. The replay backend is not neutral — it is **NVIDIA-only**, and its memory path assumes a unified-memory SoC.
+
+| Need | Enforced at | Without it |
+|---|---|---|
+| `VK_DRIVER_ID_NVIDIA_PROPRIETARY`, Vulkan 1.2+ | [`m4_window.c`](../dm/windows/tools/m4_window.c) physical-device selection | `No NVIDIA proprietary Vulkan 1.2+ device`: no window, no run |
+| `VK_EXT_mesh_shader` (`TaskEXT`/`MeshEXT`) for the game's task/mesh draws | [`m4_draw.c`](../dm/windows/tools/m4_draw.c) at draw load | `load VK_EXT_mesh_shader draw dispatch`: the forest foliage does not draw |
+| descriptor indexing with `descriptorBindingPartiallyBound` (`--compact-bindless`) | [`m4_draw.c`](../dm/windows/tools/m4_draw.c) | the compact library's pipelines cannot be created |
+| buffer device addresses (`--graphics-gmem`) | [`win_nvn_shaders.py`](../dm/windows/tools/win_nvn_shaders.py) sidecars | the checked global-memory graphics shaders are unavailable |
+| a 32-lane compute subgroup | the title library's `compute.vkc` | the NDVE compute passes do not run |
+
+An Adreno-based Windows-on-Arm laptop (Snapdragon X) stops at the first row: device selection fails by name, before any shader is touched. It is a clear refusal, not a rendering difference, so no game milestone can be reproduced there.
+
+An NVIDIA eGPU over USB4/Thunderbolt clears every row and runs the same code paths and driver family as N1X, but it does **not** restore the memory model. The fast path imports the guest's own buffers with [`VK_EXT_external_memory_host`](../dm/windows/tools/m4_gmem_import.inc); it needs a `HOST_VISIBLE|HOST_COHERENT` memory type whose heap holds the pool, and returns "not importable" — which stages instead — otherwise. With memory across USB4, the 5,080,305,664 bytes the forest imported per run are read over the link or copied, so its frame timing says nothing about N1X. Treat it as a correctness, shader and service-development machine; the baseline logged 59,965,440 staged bytes in 1,039 ranges against the imported total, and that ratio is the thing to watch when a run uses a discrete GPU. The 5 GiB free-memory and commit guard also means 32 GB is the realistic minimum, not 16 GB.
+
+Two checks before spending time there:
+
+1. An **arm64** `vulkaninfo --summary` must list the card with `driverID = NVIDIA`. An x64-only ICD cannot be loaded by the arm64 host.
+2. Build `m4_shader_smoke.exe` from a fresh `build_host.cmd` directory, point `DM_VK_SHADERS` at a library built on that machine, and run it. It shows which of the capabilities above the part exposes before a game run.
+
+A run on another device is a **new series** (`scripts/windows_checkpoint.py start-series` there); it is not comparable with `forest-profile-1795485704635991700`, which is pinned to N1X and `f856c78d`. Shader libraries and `.vkr` variants are per device as well (`--retranslate-vertices`), and behaviour recorded against N1X (for example in `m4_guest_resources.c`) may differ.
 
 ## What would falsify this plan
 
