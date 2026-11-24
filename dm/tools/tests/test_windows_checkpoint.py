@@ -15,7 +15,7 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parents[3] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
-from windows_checkpoint import Observation, backup_save, pane_opacity, read_frame, SAVE_DB  # noqa: E402
+from windows_checkpoint import Observation, backup_save, pane_opacity, parse_extra_env, read_frame, SAVE_DB  # noqa: E402
 
 
 SLOT_OPEN = b'[fs] open save:/slot_03/progress.sav -> 0x106e0\n'
@@ -34,6 +34,18 @@ def create_save(path, slot):
 
 
 class WindowsCheckpoint(unittest.TestCase):
+    def test_extra_env_passes_only_player_switches(self):
+        self.assertEqual(parse_extra_env(['DM_M4_PHASES=1', 'DM_M4_TARGET_DIFF=0']),
+                         {'DM_M4_PHASES': '1', 'DM_M4_TARGET_DIFF': '0'})
+        # The runner owns these: a caller cannot point the run at another game,
+        # rewrite, shader library or save.
+        for assignment in ('DM_GAME=x', 'DM_ROMFS=x', 'DM_SAVE=x', 'DM_VK_SHADERS=x', 'DM_CAPTURE_DIR=x', 'DM_CTL=x'):
+            with self.subTest(assignment=assignment), self.assertRaises(ValueError):
+                parse_extra_env([assignment])
+        for assignment in ('DM_M4_PHASES', 'M4_PHASES=1', '=1'):
+            with self.subTest(assignment=assignment), self.assertRaises(ValueError):
+                parse_extra_env([assignment])
+
     def test_backup_copies_the_selected_slot_without_writing_the_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

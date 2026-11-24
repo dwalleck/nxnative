@@ -3,6 +3,7 @@
 #include "m3_save.h"
 #include "m4_display.h"
 #include "m4_draw.h"
+#include "m4_phase.h"
 #include "nvn2_info.h"
 #include "../../host/account_users.h"
 #include "../../gfx/nvn/include/nvn.h"

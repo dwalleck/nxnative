@@ -230,7 +230,7 @@ static int target_span_equal(const uint8_t *a, const uint8_t *b, size_t bytes, i
     return 1;
 }
 
-static int target_plane_changed(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input, int depth24)
+static int target_plane_changed_impl(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input, int depth24)
 {
     const uint8_t *returned = d->mapped + t->offset, *original = input;
     const int tight = t->row == t->pitch;
@@ -241,7 +241,19 @@ static int target_plane_changed(const struct dm_m4_draw *d, const struct draw_tr
     return 0;
 }
 
-static int plan_target_range(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input,
+static int target_plane_changed(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input, int depth24)
+{
+    // DM_M4_TARGET_DIFF=0 reports every plane as changed, so the whole plane is
+    // written back: the compare disappears and the copy stays.
+    if (!m4_phase_target_diff()) return 1;
+    const uint64_t start = m4_phase_ticks();
+    const int changed = target_plane_changed_impl(d, t, input, depth24);
+    m4_phase_add(M4_PHASE_DIFF, start);
+    m4_phase_bytes(M4_BYTES_DIFF, (uint64_t)t->rows * t->row);
+    return changed;
+}
+
+static int plan_target_range_impl(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input,
                              int depth24, struct draw_target_range *partial)
 {
     const uint8_t *returned = d->mapped + t->offset, *original = input;
@@ -286,6 +298,19 @@ static int target_download_aliases(const struct dm_m4_draw *d, const struct dm_m
     return 0;
 }
 
+static int plan_target_range(const struct dm_m4_draw *d, const struct draw_transfer *t, const void *input,
+                             int depth24, struct draw_target_range *partial)
+{
+    // DM_M4_TARGET_DIFF=0 leaves an empty partial range, which is the whole-plane
+    // writeback, and records the same bytes without the compare.
+    if (!m4_phase_target_diff()) { partial->first = 0; partial->end = 0; return 1; }
+    const uint64_t start = m4_phase_ticks();
+    const int changed = plan_target_range_impl(d, t, input, depth24, partial);
+    m4_phase_add(M4_PHASE_DIFF, start);
+    m4_phase_bytes(M4_BYTES_DIFF, (uint64_t)t->rows * t->row);
+    return changed;
+}
+
 static VkImageAspectFlags changed_target_aspects(const struct dm_m4_draw *d, const struct dm_m4_draw_info *info,
                                                  const struct dm_m4_draw_attachment *src, struct draw_target *t,
                                                  uint32_t earlier_colors)
@@ -306,8 +331,8 @@ static VkImageAspectFlags changed_target_aspects(const struct dm_m4_draw *d, con
     return changed;
 }
 
-static void download_target(struct dm_m4_draw *d, const struct dm_m4_draw_attachment *src,
-                            const struct draw_target *t, VkImageAspectFlags aspects)
+static void download_target_impl(struct dm_m4_draw *d, const struct dm_m4_draw_attachment *src,
+                                 const struct draw_target *t, VkImageAspectFlags aspects)
 {
     if (t->partial.end) {
         const struct draw_transfer *p = &t->pixels;
@@ -324,6 +349,15 @@ static void download_target(struct dm_m4_draw *d, const struct dm_m4_draw_attach
     if (aspects & t->copies[0].imageSubresource.aspectMask) download_plane(d, &t->pixels, src->pixels.data);
     if (t->copy_count == 2 && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
         download_plane(d, &t->stencil, src->stencil.data);
+}
+
+static void download_target(struct dm_m4_draw *d, const struct dm_m4_draw_attachment *src,
+                            const struct draw_target *t, VkImageAspectFlags aspects)
+{
+    const uint64_t start = m4_phase_ticks();
+    download_target_impl(d, src, t, aspects);
+    m4_phase_add(M4_PHASE_READBACK, start);
+    m4_phase_bytes(M4_BYTES_READBACK, (uint64_t)t->pixels.rows * t->pixels.row);
 }
 
 static void complete_target(const struct dm_m4_draw_attachment *src, const struct draw_target *t)
@@ -752,13 +786,17 @@ static VkResult finish_recording(struct dm_m4_draw *d, VkDeviceSize used,
     const VkSubmitInfo submission = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &d->cmd,
     };
+    uint64_t phase_start = m4_phase_ticks();
     r = d->QueueSubmit(d->device->queue, 1, &submission, d->fence);
+    m4_phase_add(M4_PHASE_SUBMIT, phase_start);
     if (r != VK_SUCCESS) {
         d->queue_error = r;
         return failure(step, "submit staged commands to Vulkan queue", r);
     }
     d->in_flight = 1;
+    phase_start = m4_phase_ticks();
     r = d->WaitForFences(vk, 1, &d->fence, VK_TRUE, UINT64_MAX);
+    m4_phase_add(M4_PHASE_WAIT, phase_start);
     if (r != VK_SUCCESS) {
         d->queue_error = r;
         return failure(step, "wait for staged Vulkan fence", r);
@@ -1051,6 +1089,7 @@ VkResult dm_m4_draw_submit(struct dm_m4_draw *d, const struct dm_m4_draw_info *i
     if (step) *step = NULL;
     if (info && info->attachment_writes) *info->attachment_writes = (struct dm_m4_draw_attachment_writes){0};
     if (!d || !info) return failure(step, "draw submit arguments", VK_ERROR_INITIALIZATION_FAILED);
+    m4_phase_draw();
     VkResult r = reset_recording(d, step);
     if (r != VK_SUCCESS) return r;
     const int mesh = info->ms.shader != NULL;

@@ -21,6 +21,7 @@ DM_AUDREN_TRACE	diagnostic	When set, the CPU audio renderer logs every update wi
 DM_AV1_DAV1D	switch	`=1` decodes AV1 movies with dav1d even where VideoToolbox decodes AV1 (Apple M3 and A17 Pro on), to compare the two or to check the path older chips take (`hle_movie_av1.c`)
 DM_BOOTPROF	diagnostic	When set, logs boot timing: the loader's breakdown (mapping, relocation, probes), Metal library loading, pipeline creation, texture uploads and the first present
 DM_BUNDLE_ID	switch	Overrides the iOS app's bundle ID in `build_ipa.sh` (default `org.nxnative.<title ID in lowercase>`)
+DM_CAPTURE_DIR	path	Directory the Windows host writes overlay captures and frame images to; the checkpoint runner passes its run directory
 DM_CHEATS	path	Folder of Atmosphère cheat files: `<folder>/<build ID>.txt` or an SD-card layout (`atmosphere/contents/<title ID>/cheats/`) under it (default `<DM_ROOT>/cheats`); the Mac menu lists and toggles them
 DM_CHEATS_ANY_BUILD	switch	`1` loads a cheat file written for another build of the game when it is the only one (its addresses may not fit: for `cheat_anchor.py` checks)
 DM_CHEATS_DEBUG	diagnostic	Logs every memory write a cheat makes and the cheat file context the menu's "another version" rows come from
@@ -119,6 +120,7 @@ DM_JIT_SERVE	path	Folder of a `nn::jit` image (`jit.img`, `jit.tsv`, `jit.out`):
 DM_KBD	switch	`=<text>`: the system keyboard returns that text as OK without showing an input box; unset with no window, it returns cancel
 DM_KBD_PLAYER	switch	`own` makes the Mac keyboard player 1 on its own, with controllers from player 2 on (by default the first controller shares player 1 with the keyboard)
 DM_KEEP_ALIAS_CUTS	diagnostic	`=1` (Mac): keeps rewriter cuts marked `ALIAS_CUT` in place at load instead of restoring the original bytes on a 64 GB alias region (`loader.c` `undo_alias_cuts`); `scripts/build_ipa_from_nsp.py`'s `region_check` sets it so derived-profile checks measure the iPhone binary's reservations
+DM_KEYBOARD	diagnostic	`1`: the Windows window reads the keyboard instead of XInput; `Z`/Enter confirms, `X`/Backspace goes back
 DM_KEYS	switch	Scripted input: `<seconds or f<frame>>:<key>[+key][~hold or ~f<frames>][*count/interval],…` presses buttons, sticks, touches and `Shake` at those times; `=@<file>` reads the steps from the file
 DM_LANG	player	Game language as a language code (default `en-US`; the iOS app sets the one the IPA was packed with)
 DM_LAUNCHER	switch	`0` skips the iOS settings screen or the Mac settings window and starts the game at once, with the saved choices (on the Mac also `--no-launcher`)
@@ -126,6 +128,8 @@ DM_LAUNCH_PARAM	path	File whose bytes `oe::TryPopLaunchParameter` returns once; 
 DM_LINK_VTICK	switch	`0` keeps the system's display-link rate on 144 or 165 Hz Mac screens; by default the link counts only the refreshes nearest a steady 1/60 s clock
 DM_LOADHASH	diagnostic	`=1` logs an address-independent SHA-256 per module after loading
 DM_LONGFRAME	diagnostic	`0` turns off the long-frame log (on by default), a line for a frame over 20 ms or with GPU time over 16.7 ms that is clearly above recent frames
+DM_M4_PHASES	diagnostic	`=1`: one `[m4 phase]` line per presented frame with the replay phase times and bytes (submit, wait, readback, diff, writeback, deswizzle)
+DM_M4_TARGET_DIFF	diagnostic	`=0`: diagnostic A/B only — writes every render target plane back instead of diffing it, to price the compare against the copy
 DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the measuring lock `scripts/bench.py --lock` shares: held only while a game runs, and the harness's shader builds pause while another process holds it
 DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …); on iOS a relative path is under `Documents`, and `Documents/env.txt` can set it
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
@@ -313,6 +317,12 @@ DM_OODLE_JOB	path	`=<job file>`: the host runs the game's own Oodle decoder on e
 DM_OODLE_MODULES	path	The rewritten modules the Mac host's Oodle tool mode loads when `shader_split.py` decodes Trinity packs; set by the NSP script
 DM_OODLE_SERVE	switch	`=1`: the host answers decode requests on stdin / stdout with the game's own Oodle (or LZ5) decoder from the guest main thread before the SDK starts, until stdin ends
 DM_OPMODE	player	The operation mode the game sees: `0` handheld, `1` console (default: the profile's `op_mode`, console unless set); read once at startup
+DM_OVERLAY_BLIT	diagnostic	`<key>:<count>` of the final blit the Windows overlay capture follows
+DM_OVERLAY_CAPTURE	diagnostic	`1`: the Windows overlay capture runs for the `DM_OVERLAY_*` selectors, writing a before/after image and an opacity row per present
+DM_OVERLAY_PS	diagnostic	16-hex key of the fragment shader whose output pane the Windows overlay capture reads
+DM_OVERLAY_PS_INPUTS	diagnostic	`stage:word[,word]` inputs the Windows overlay capture reads from the fragment shader's storage buffer
+DM_OVERLAY_VS	diagnostic	16-hex key of the vertex shader the Windows overlay capture follows
+DM_OVERLAY_VS_INPUTS	diagnostic	`stage:word[,word]` inputs the Windows overlay capture reads from the vertex shader's storage buffer
 DM_PAD_IDENTICAL	switch	`0` stops reading identical pads here when GameController lists fewer of their model than IOKit has, such as two Pro Controllers over USB (each a player of its own: a Pro Controller from its report 0x30, another model from its HID elements; `pad_hid_mac.h`, `pad_pro.h`); `DM_HID_PADS=0` stops it too; Mac only
 DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
 DM_PAD_PRESS_TO_JOIN	player	`1`: a controller is no player until one of its buttons is pressed, then it is the lowest player free, whatever its port, link or model, identical pads included (`front_mac.m`, `DmGamepad.m`, `pad_slots.h`); not with `DM_PAD_MERGE`. Launcher setting
@@ -321,6 +331,7 @@ DM_PHONE_MOTION	switch	On iOS, whether the phone's own device motion drives play
 DM_PICTURE_FIT	player	`fill` scales the 16:9 picture on the iPhone and iPad until it covers the screen in landscape and crops the edges (a portrait or tabletop split and a TV stay fitted); `fit` or unset, the largest 16:9 rectangle with black bars. Launcher and in-game menu setting
 DM_PREEMPT	switch	`0` / `1` overrides the profile's `core_preempt`: also check already-runnable higher-priority peers on the caller's core after every thread SVC
 DM_PRELOAD	diagnostic	Set: on the Mac, runs the host's early background loading (`dm_host_preload_start`) as the iOS app does, to exercise that path
+DM_PRESENT_COUNTER	diagnostic	Names the file the Windows window appends each accepted present's number and timestamp to (`present.tsv`)
 DM_PRESENT_DEPTH	switch	`=<n>` (default 1): without the display link (`DM_PRESENT_LINK=0`), the acquire waits until at most n presents queued are not yet on screen or dropped, as the drawables' presented handlers report, so a frame cap the game holds no longer piles frames up in the present queue and the layer's drawables (not with present snapshots); `0` is the Switch's double buffering, which a Mac holds only below the screen's rate (about 40 fps at most at a 60 fps cap). Each 300 shown frames the log gives the time from the game's enqueue to the screen (`present: game enqueue to screen`) and these waits
 DM_PRESENT_DRAIN	switch	`1` / `0`: whether frames standing in the display link's present queue are drained (the acquire waits them out once, after the game has kept up for 2 s; no frame is dropped), and whether a 30 fps target keeps the 60 Hz display link in a window, where the drain halves a frame's wait for its tick; default on on the Mac, off on iOS
 DM_PRESENT_FIFO	switch	`0` makes the display link take the newest queued frame each tick, as before; by default it shows frames in order, at most one tick behind
@@ -473,13 +484,20 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_GMEM_STATS	diagnostic	Set: prints the checked global-memory imported and staged ranges and bytes on each checked draw
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_SHADERS	path	Offline shader library the Windows replay loads (`graphics.vkc`, `.spv`, `.vkr`)
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WAKE_UNLOCKED	switch	`0` signals a woken guest thread while the waker still holds the thread lock, as before; by default the signal comes after the lock is let go, so the woken thread does not sleep again on it ([Wakes signalled after the scheduler lock is let go](reference/threads.md#wakes-signalled-after-the-scheduler-lock-is-let-go))
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path
 DM_WATCH_STALL	diagnostic	`=<s>`: when the frame loop makes no progress for that long (default 15 with `DM_WATCH`), logs a red line, dumps the threads and exits
 DM_WEB_LOG	diagnostic	`1` logs each key an offline HTML page is given and where the focus is after it
+DM_WINARM64_GAME_REWRITE	test	Windows rewrite directory the native tests use instead of rewriting a fixture
+DM_WINARM64_M1_DIR	test	Directory with the built M1 probe and guest fixture for the native tests
+DM_WINARM64_M2_DIR	test	Directory with `build_host.cmd` output that the native tests drive
+DM_WINARM64_M3_DIR	test	Directory with the M3 fixtures the native tests drive
+DM_WINARM64_M4_WSI	test	Set: the native tests also present three real Vulkan frames through the window
 DM_WINDOW	switch	When set (to any value, `0` included) opens a Mac window with keyboard and controller input; unset runs headless with the guest on the current thread; the Mac launcher sets it
 DM_WINDOWLESS_ROLE	switch	`0` keeps the existing task role for a windowless Mac run. By default the host requests the [default application task role](reference/audio.md#underruns-in-a-run-without-a-window) to enable interactive QoS
 DM_WINDOW_TOP	diagnostic	`1` (Mac, with `DM_WINDOW`) orders the game window in front without activating it and keeps it above other apps' windows, so a covered window does not slow the run; `regress.py` sets it

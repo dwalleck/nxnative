@@ -10,7 +10,7 @@ cl /nologo /std:c11 /O2 /Z7 /MP /W4 /WX /Fe:m2_host.exe /I "%dm%\third_party\vul
     "%src%m3_audio.c" "%src%m3_opus.c" "%src%m3_save.c" "%src%m3_save_store.c" "%src%m3_socket.c" ^
     "%src%m3_video.c" "%src%m3_av1.c" ^
     "%src%m4_display.c" "%src%m4_window.c" "%src%m4_replay_device.c" "%src%m4_draw.c" "%src%m4_overlay.c" ^
-    "%src%m4_shader.c" "%src%m4_pipeline.c" "%src%m4_guest_resources.c" "%src%m4_guest_draw.c" ^
+    "%src%m4_shader.c" "%src%m4_pipeline.c" "%src%m4_guest_resources.c" "%src%m4_guest_draw.c" "%src%m4_phase.c" ^
     "%dm%\gfx\nvn\nvn_tex.c" "%dm%\gfx\tex\nvn_deswizzle.c" m2_gate.obj ^
     /link /DEBUG:FULL /INCREMENTAL:NO /OPT:REF,ICF /PDB:m2_host.pdb MinCore.lib User32.lib winsqlite3.lib || exit /b 1
 cl /nologo /std:c11 /O2 /W4 /WX /I "%dm%\third_party\vulkan-headers\include" ^

@@ -167,5 +167,6 @@ static int present_display(const struct headless_window *owner, const struct hea
                                   format, fill_scanout, &src, capture ? &frame : NULL);
     ReleaseSRWLockExclusive(&display_lock);
     if (r != VK_SUCCESS && r != VK_NOT_READY) dm_fail("nvnQueuePresentTexture: Vulkan present returned %d", (int)r);
+    m4_phase_present();
     return r == VK_SUCCESS ? 1 : 2;
 }

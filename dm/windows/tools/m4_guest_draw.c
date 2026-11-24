@@ -1,5 +1,6 @@
 #define VK_NO_PROTOTYPES
 #include "m4_guest_resources.h"
+#include "m4_phase.h"
 #include "m4_replay.h"
 #include "m4_overlay.h"
 
@@ -347,9 +348,14 @@ static const char *submit_graphics(struct dm_m4_guest_resources *resources,
         info->attachment_writes = &writes;
         const int capture = role != DM_M4_OVERLAY_NONE &&
             dm_m4_overlay_draw_begin(session->overlay, role, info, overlay_target(info, state, resolve));
-        if (dm_m4_draw_submit(session->draw, info, &step) == VK_SUCCESS)
+        const uint64_t submit_start = m4_phase_ticks();
+        const VkResult submitted = dm_m4_draw_submit(session->draw, info, &step);
+        m4_phase_add(M4_PHASE_DRAW, submit_start);
+        if (submitted == VK_SUCCESS) {
+            const uint64_t phase_start = m4_phase_ticks();
             error = dm_m4_guest_resources_writeback(resources, &writes);
-        else
+            m4_phase_add(M4_PHASE_WRITEBACK, phase_start);
+        } else
             error = step ? step : "Vulkan draw submission failed";
         if (capture) dm_m4_overlay_draw_end(session->overlay, role, info, !error);
     }

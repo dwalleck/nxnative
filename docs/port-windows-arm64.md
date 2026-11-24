@@ -447,6 +447,14 @@ The stage/key lines report completed Vulkan submissions, not merely shader loads
 
 `m4_shader_smoke.exe --shading-rate` needs no title files. On N1X it reads back the fragment size for a mixed 1×1/2×2 rate image, changed palettes, a null rate image, and two primitives selecting different tables in one draw. To rebuild affected classic vertex stages from an older library, add `--retranslate-vertices --manifest <keys> --base <old> --out <new>` to the original shader-build options. The translated shader forwards the original NVN VPRS output to a Vulkan viewport index only in per-primitive palette mode; each replicated viewport uses identical geometry.
 
+#### Time a present
+
+`DM_M4_PHASES=1` prints one `[m4 phase]` line per presented frame with the time spent in each replay phase — `submit`, the fence `wait`, target `readback`, the render-target `diff`, guest `writeback` and texture `deswizzle` — the bytes each moved, and the frame's draw count. It is off by default: the QPC calls and a log line per present are not free. The checkpoint runner strips every `DM_*` it inherits, so pass it through with `--env DM_M4_PHASES=1`.
+
+`DM_M4_TARGET_DIFF=0` is a diagnostic A/B, not a fix: every render target plane reports itself as changed, so the diff is replaced by a whole-plane writeback. The guest still receives every byte; the work moves from compare to copy.
+
+The phases do not cover the frame. Recording, uploads and driver time outside these calls are unmeasured, so compare a phase against the present interval, not against 100% of it.
+
 #### Repeat the Vulkan replay fixtures
 
 After `build_host.cmd`, in the ARM64 build scratch directory, set `DM_VK_SHADERS` to the offline library and run [the smoke](../dm/windows/tools/m4_shader_smoke.c):

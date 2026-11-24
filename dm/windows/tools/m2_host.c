@@ -1,6 +1,7 @@
 // Windows bring-up host: native ARM64 guest threads and SDK/SVC dispatch.
 #include "m2_host.h"
 #include "m4_window.h"
+#include "m4_phase.h"
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #include <inttypes.h>
@@ -1293,6 +1294,7 @@ int main(int argc, char **argv) {
         dm_fail("requires a native Windows ARM64 executable");
     if (argc < 4 || argc - 3 > ARRAYSIZE(modules))
         dm_fail("usage: m2_host <game.tsv|--fixture> <rewrite dir> <module>... (in load order)");
+    m4_phase_init();
     fixture_mode = !strcmp(argv[1], "--fixture");
     char *setting = NULL;
     if (!_dupenv_s(&setting, NULL, "DM_SVC")) trace = setting && *setting;

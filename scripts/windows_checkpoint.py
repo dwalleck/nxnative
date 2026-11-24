@@ -61,6 +61,20 @@ class JobLimits(ct.Structure):
                 ('peak_process_memory', ct.c_size_t), ('peak_job_memory', ct.c_size_t)]
 
 
+RUN_ENV_RESERVED = ('DM_GAME', 'DM_ROMFS', 'DM_SAVE', 'DM_VK_SHADERS', 'DM_CAPTURE_DIR', 'DM_CTL')
+
+
+def parse_extra_env(assignments: list[str]) -> dict[str, str]:
+    """The DM_* variables a caller adds with --env, after the runner stripped its own."""
+    extra = {}
+    for assignment in assignments:
+        name, separator, value = assignment.partition('=')
+        if not separator or not name.startswith('DM_') or name in RUN_ENV_RESERVED:
+            raise ValueError(f'--env expects DM_<name>=<value> outside {", ".join(RUN_ENV_RESERVED)}: {assignment!r}')
+        extra[name] = value
+    return extra
+
+
 def winerror() -> OSError:
     return getattr(ct, 'WinError')()
 
@@ -443,12 +457,14 @@ def launch(args, root: Path, win: Windows, obs: Observation) -> int:
         obs.checkpoint['preflight_bytes'] = backup_save(source, scratch / SAVE_DB, deadline)
         ctl = root / 'input.txt'
         ctl.touch(exist_ok=False)
+        extra = parse_extra_env(args.env)
         env = {key: value for key, value in os.environ.items() if not key.upper().startswith('DM_')}
         env.update(DM_GAME=profile.parent.name, DM_ROMFS=str(romfs), DM_SAVE=str(scratch),
                    DM_VK_SHADERS=str(shaders), DM_CAPTURE_DIR=str(root), DM_CTL=str(ctl),
                    DM_WINDOW='1', DM_KEYBOARD='1', DM_OPMODE='0', DM_FS='1')
         if args.overlay_capture:
             env.update(settings, DM_OVERLAY_CAPTURE='1')
+        env.update(extra)
         with win.player_job() as job, StallTrace(root, host, args.stall_seconds) as trace:
             obs.data['cpu_trace'] = trace.state
             pdb = host.with_suffix('.pdb')
@@ -457,7 +473,7 @@ def launch(args, root: Path, win: Windows, obs: Observation) -> int:
                                profile=profile, rewrite=rewrite, romfs=romfs,
                                capture_settings={'overlay': args.overlay_capture, 'selectors': settings,
                                                  'stall_seconds': args.stall_seconds, 'timeout_seconds': args.timeout,
-                                                 'opmode': env['DM_OPMODE'], 'slot': SLOT})
+                                                 'opmode': env['DM_OPMODE'], 'slot': SLOT, 'env': extra})
             obs.data['manifest'] = 'manifest.json'
             if args.stall_seconds:
                 env['DM_PRESENT_COUNTER'] = trace.name
@@ -590,6 +606,8 @@ def main() -> int:
     setup.add_argument('--stall-seconds', type=float, default=30, metavar='SECONDS',
                        help='trace once after this gap in accepted presents (default 30; 0 disables)')
     setup.add_argument('--timeout', type=float, default=1800, metavar='SECONDS', help='whole-run deadline (default 1800)')
+    setup.add_argument('--env', action='append', default=[], metavar='NAME=VALUE',
+                       help='extra DM_* variable for the player (repeatable); the runner strips the caller\'s own')
     query = commands.add_parser('status', help='print checkpoint evidence and live status as JSON')
     query.add_argument('--run-dir', required=True, type=Path)
     args = cli.parse_args()

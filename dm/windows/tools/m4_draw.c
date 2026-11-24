@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "m4_draw.h"
+#include "m4_phase.h"
 #include "m4_bytes_equal.h"
 
 #include <assert.h>

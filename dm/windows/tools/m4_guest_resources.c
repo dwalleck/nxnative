@@ -1,6 +1,7 @@
 #include "m4_guest_resources.h"
 #include "m4_replay.h"
 #include "../../gfx/tex/nvn_deswizzle.h"
+#include "m4_phase.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -790,9 +791,12 @@ static const char *mip_planes(struct preparation *p, const struct texture_view *
     // mip; array layers instead use separate full mip chains in guest storage.
     for (unsigned layer = 0; layer < view->layers; ++layer, data += size) {
         const unsigned level = view->level + mip, index = view->layer + layer;
+        const uint64_t phase_start = m4_phase_ticks();
         const int error = view->desc.target == NVN_TEXTURE_TARGET_3D && !view->depth ?
             nvn_deswizzle_slice(&view->desc, level, index, view->slice, view->storage, data, pitch) :
             nvn_deswizzle(&view->desc, level, index, view->storage, data, pitch);
+        m4_phase_add(M4_PHASE_DESWIZZLE, phase_start);
+        m4_phase_bytes(M4_BYTES_DESWIZZLE, size);
         if (error)
             return "NVN draw resources: failed to deswizzle guest texture mip";
         pixels[(size_t)layer * view->levels] = (struct dm_m4_draw_pixels){data, size, pitch};
@@ -1008,9 +1012,14 @@ static const char *attachment_pixels(struct preparation *p, const struct texture
                 m4_bytes_equal(attachment_snapshot(entry, snapshot_size), guest, snapshot_size) ?
                 SNAPSHOT_MATCH : SNAPSHOT_DIFFERS;
         }
-        if (match != SNAPSHOT_MATCH &&
-            nvn_deswizzle(&view->desc, view->level, view->layer, view->storage, data, row_bytes))
-            return "NVN draw resources: failed to deswizzle guest texture mip";
+        if (match != SNAPSHOT_MATCH) {
+            const uint64_t phase_start = m4_phase_ticks();
+            const int failed = nvn_deswizzle(&view->desc, view->level, view->layer, view->storage, data, row_bytes);
+            m4_phase_add(M4_PHASE_DESWIZZLE, phase_start);
+            m4_phase_bytes(M4_BYTES_DESWIZZLE, (uint64_t)rows * row_bytes);
+            if (failed)
+                return "NVN draw resources: failed to deswizzle guest texture mip";
+        }
     }
     if (entry) {
         entry->layout = layout;
@@ -1407,8 +1416,12 @@ static const char *write_sample_mip(void *context, uint32_t mip, struct dm_m4_dr
         return "NVN draw resources: sampled mip layers disagree with staging";
     uint8_t *data = dst.data;
     for (unsigned layer = 0; layer < view->layers; ++layer, data += layer_bytes) {
-        if (nvn_deswizzle_from(&view->desc, view->level + mip, view->layer + layer,
-                               sample->upload.encoded, view->view_offset, data, pitch))
+        const uint64_t phase_start = m4_phase_ticks();
+        const int failed = nvn_deswizzle_from(&view->desc, view->level + mip, view->layer + layer,
+                                              sample->upload.encoded, view->view_offset, data, pitch);
+        m4_phase_add(M4_PHASE_DESWIZZLE, phase_start);
+        m4_phase_bytes(M4_BYTES_DESWIZZLE, layer_bytes);
+        if (failed)
             return "NVN draw resources: failed to deswizzle guest texture mip";
     }
     return NULL;
@@ -2038,6 +2051,7 @@ const char *dm_m4_guest_resources_writeback(struct dm_m4_guest_resources *worksp
         const VkImageAspectFlags aspects = writeback_aspects(w, writes);
         if (!aspects) continue;
         const struct texture_view *view = &w->view;
+        m4_phase_bytes(M4_BYTES_WRITEBACK, (uint64_t)view->width * view->height * view->bpb);
         if (w->depth) {
             // The packed rows still hold the pre-draw bytes of the other plane and texel padding.
             const int depth24 = view->format == NVN_FORMAT_DEPTH24 || view->format == NVN_FORMAT_DEPTH24_STENCIL8;
