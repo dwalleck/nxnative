@@ -285,12 +285,14 @@ The question is whether **upstream integration alone** changes the Kokiri Forest
 
 **Fresh terminal on the N1X: start here.** `WORK`, `OUT`, and `DM_*` are **not** machine settings. Earlier `set`/`$env:` commands only affected that shell and its children. To **resume the recorded series**, run this in PowerShell from the **integrated** checkout (`nxnative-win-integration`, branch `test/windows-arm64-f856c78d`); do not fetch again or use the title-screen shader library. The older `nxnative` checkout stays untouched as rollback evidence: it holds the `ea5ab250` baseline and its run. For another machine, substitute its external work directory, run and series.
 
-This clone is a **fork** of `seedds/nxnative`. `origin` is the upstream project, for fetching series pins only; never push to it. Add the fork once and push branches there:
+This clone is a **fork** of `seedds/nxnative`. `origin` is the upstream project, for fetching series pins only; never push to it. The fork is `dwalleck/nxnative` on the `fork` remote, and the branch already tracks it:
 
 ```powershell
-git remote add fork https://github.com/<account>/nxnative.git   # once
-git push -u fork test/windows-arm64-f856c78d
+git remote -v      # fork -> dwalleck/nxnative, origin -> seedds/nxnative
+git push fork test/windows-arm64-f856c78d
 ```
+
+An upstream pull request compares `main...dwalleck:nxnative:test/windows-arm64-f856c78d`.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
