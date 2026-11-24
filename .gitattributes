@@ -1,0 +1,21 @@
+# Every text file is stored with LF in the index and checked out with LF on
+# every platform, so a file's bytes do not depend on core.autocrlf. Tools that
+# hash inputs as raw bytes (dm/gfx/tools/dmsh_chain.py hashes profile tables)
+# otherwise disagree between a Windows and a macOS checkout of the same commit.
+* text=auto eol=lf
+
+# cmd.exe entry points: these two formats are parsed by the console host, so
+# they keep CRLF in the working tree.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Fixtures, archives and shipped executables stay byte-exact everywhere.
+*.jpg binary
+*.png binary
+*.gz binary
+*.u32 binary
+*.nso binary
+*.pak binary
+*.bin binary
+dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate binary
+dm/gfx/tools/spirv_cross_bin/spirv-cross binary
